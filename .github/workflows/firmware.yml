@@ -1,0 +1,35 @@
+name: Build and publish KNOB firmware
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'platformio.ini', '.github/workflows/firmware.yml', 'scripts/**']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: knob-firmware-main
+  cancel-in-progress: false
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install platformio==6.1.18
+      - run: pio run
+      - run: python3 scripts/publish_manifest.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airControl-KNOB-firmware
+          path: firmware/
+      - name: Publish firmware to main
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add firmware/
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish firmware [skip ci]"
+            git push origin HEAD:main
+          fi
