@@ -1,7 +1,7 @@
 {
   "version": "0.8.0",
   "board": "onx2424g013",
-  "size": 1275632,
-  "md5": "ca50756dd9c0c4282f5f869fb503e682",
+  "size": 1275888,
+  "md5": "b6b93b892f77b54fd0852fe06990913c",
   "url": "https://raw.githubusercontent.com/keshman74/airKNOB/experimental/multichip-v0.8.0/firmware/firmware.bin"
 }
