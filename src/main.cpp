@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <WiFiUdp.h>
 #include <WiFiManager.h>
 #include <HTTPClient.h>
@@ -38,7 +39,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.7.3";
+constexpr char kFirmwareVersion[] = "0.8.0";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -189,7 +190,7 @@ uint32_t lastInteractionAt = 0;
 bool displayDimmed = false;
 enum class MenuScreen : uint8_t { Player, Home, Presets, Source, Multiroom,
                                   Join, Zone, Settings, EqPresets, ToneList, ToneEdit, LeaveConfirm,
-                                  DeviceInfo, NetworkInfo, MemoryInfo, Scan };
+                                  DeviceInfo, NetworkInfo, MemoryInfo, Scan, EqBands, EqBandEdit };
 MenuScreen menuScreen = MenuScreen::Player;
 int selectedItem = 0;
 String menuMessage;
@@ -201,8 +202,97 @@ int editingTone = 0;
 int editingRaw = 0;
 String toneMessage;
 bool mcuCommand(const String& payload, String* reply = nullptr);
-struct ZoneInfo { String ip; String name; String uuid; };
-ZoneInfo zones[8];
+enum class Chip : uint8_t { Unknown, A31, A97, A98, A33 };
+struct Endpoint { Chip chip = Chip::Unknown; uint16_t port = 80; bool tls = false; };
+Endpoint activeEndpoint;
+struct ZoneInfo { String ip; String name; String uuid; Endpoint endpoint; };
+constexpr int kMaxZones = 20;
+ZoneInfo zones[kMaxZones];
+WiFiUDP cloudDiscoveryUdp;
+uint8_t scanPortIndex = 0;
+String reportedArtworkUrl;
+String discoveredSourceNames[12];
+String discoveredSourceModes[12];
+int discoveredSourceCount = 0;
+bool sourceCapabilitiesKnown = false;
+const char* const kBandNames[] = {"31 Hz", "63 Hz", "125 Hz", "250 Hz", "500 Hz", "1 kHz", "2 kHz", "4 kHz", "8 kHz", "16 kHz"};
+const char* const kBandParams[] = {"band31hz", "band63hz", "band125hz", "band250hz", "band500hz", "band1khz", "band2khz", "band4khz", "band8khz", "band16khz"};
+int graphicBands[10] = {};
+bool graphicKnown = false;
+bool graphicEnabled = false;
+int editingBand = 0;
+int editingBandValue = 0;
+
+const char* chipName(Chip chip) {
+  switch (chip) { case Chip::A31: return "A31"; case Chip::A97: return "A97";
+    case Chip::A98: return "A98"; case Chip::A33: return "A33"; default: return "UNKNOWN"; }
+}
+bool isCloud() { return activeEndpoint.chip == Chip::A33; }
+void applyEndpoint(const Endpoint& endpoint) {
+  activeEndpoint = endpoint;
+  graphicKnown = false;
+  a31Tcp.stop(); tcpInputLength = 0; lastTcpAttemptAt = 0; a31TcpIp = "";
+  discoveredSourceCount = 0; sourceCapabilitiesKnown = false; reportedArtworkUrl = "";
+  for (int i = 0; i < 3; ++i) toneKnown[i] = false;
+  virtualBassKnown = false;
+}
+Chip classifyChip(JsonVariantConst info) {
+  String platform = String(info["hardware"] | "") + " " + String(info["project"] | "");
+  platform.toUpperCase();
+  if (platform.indexOf("A31") >= 0 || platform.indexOf("UP2STREAM_PRO_V4") >= 0) return Chip::A31;
+  if (platform.indexOf("A97") >= 0 || platform.indexOf("ALLWINNER") >= 0 || platform.indexOf("R328") >= 0) return Chip::A97;
+  if (platform.indexOf("A98") >= 0 || platform.indexOf("AMLOGIC") >= 0 || platform.indexOf("A113") >= 0) return Chip::A98;
+  if (!info["DevVolumeL"].isNull() || !info["ProjectName"].isNull() || !info["UserDevName"].isNull()) return Chip::A33;
+  return Chip::Unknown;
+}
+String encodeCommand(const String& value) {
+  String out;
+  const char* hex = "0123456789ABCDEF";
+  for (size_t i = 0; i < value.length(); ++i) {
+    const uint8_t c = value[i];
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == ':' || c == '/') out += char(c);
+    else { out += '%'; out += hex[c >> 4]; out += hex[c & 15]; }
+  }
+  return out;
+}
+bool readEndpoint(const String& ip, const Endpoint& endpoint, const String& command,
+                  String& response, uint32_t timeoutMs = 1200) {
+  IPAddress address;
+  if (WiFi.status() != WL_CONNECTED || !address.fromString(ip)) return false;
+  WiFiClient plain;
+  WiFiClientSecure secure;
+  // Local players use self-signed TLS certificates, as in desktop airControl.
+  if (endpoint.tls) { secure.setInsecure(); secure.setHandshakeTimeout(2); }
+  HTTPClient http;
+  http.setConnectTimeout(350); http.setTimeout(timeoutMs);
+  const String path = endpoint.chip == Chip::A33 ? "/?Instruct=" : "/httpapi.asp?command=";
+  const String url = String(endpoint.tls ? "https://" : "http://") + ip + ":" + String(endpoint.port) + path + encodeCommand(command);
+  if (!(endpoint.tls ? http.begin(secure, url) : http.begin(plain, url))) return false;
+  const int status = http.GET();
+  response = status == 200 ? http.getString() : "";
+  http.end();
+  return status == 200 && response.length() && response.indexOf("unknown comman") < 0;
+}
+bool detectEndpoint(const String& ip, Endpoint& endpoint, String& statusBody) {
+  const uint16_t ports[] = {80, 8000, 443, 8443};
+  IPAddress address; if (!address.fromString(ip)) return false;
+  for (int i = 0; i < 4; ++i) {
+    WiFiClient probe;
+    if (!probe.connect(address, ports[i], 90)) continue;
+    probe.stop();
+    Endpoint candidate; candidate.port = ports[i]; candidate.tls = i >= 2;
+    candidate.chip = (i == 1 || i == 3) ? Chip::A33 : Chip::Unknown;
+    String body; if (!readEndpoint(ip, candidate, "getStatusEx", body, 900)) continue;
+    DynamicJsonDocument doc(12288);
+    if (deserializeJson(doc, body)) continue;
+    candidate.chip = classifyChip(doc.as<JsonVariantConst>());
+    if (candidate.chip == Chip::Unknown) continue;
+    if ((candidate.chip == Chip::A33) != (i == 1 || i == 3)) continue;
+    endpoint = candidate; statusBody = body; return true;
+  }
+  return false;
+}
+
 int zoneCount = 0;
 WiFiUDP discoveryUdp;
 MenuScreen scanReturnScreen = MenuScreen::Zone;
@@ -298,7 +388,23 @@ void serviceVolumeDuringArtwork() {
   if (WiFi.status() == WL_CONNECTED) settingsServer.handleClient();
 }
 
+bool request(const String& command, String& response);
 String fetchArtworkAddress() {
+  if (isCloud()) return reportedArtworkUrl;
+  if (activeEndpoint.chip != Chip::A31) {
+    String body;
+    if (request("getMetaInfo", body)) {
+      DynamicJsonDocument info(6144);
+      if (!deserializeJson(info, body)) {
+        JsonVariant data = info["metaData"]; if (data.isNull()) data = info.as<JsonVariant>();
+        const String title = String(data["title"] | ""), artist = String(data["artist"] | "");
+        if (title.length() && (title != trackTitle || artist != trackArtist)) { trackTitle = title; trackArtist = artist; marqueeOffset = 0; marqueeStartedAt = millis(); }
+        String art = String(data["albumArtURI"] | "");
+        if (art.isEmpty()) art = String(data["albumArtURI "] | "");
+        if (art.length()) return art;
+      }
+    }
+  }
   WiFiClient client;
   client.setTimeout(2);
   const String body = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:GetPositionInfo xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"><InstanceID>0</InstanceID></u:GetPositionInfo></s:Body></s:Envelope>";
@@ -330,19 +436,17 @@ String fetchArtworkAddress() {
 bool downloadAndDecodeArt(String url) {
   // This exact Qobuz CDN hostname was verified to serve the same cover over
   // HTTP 200. Do not downgrade other HTTPS hosts without checking them.
-  if (url.startsWith("https://static.qobuz.com/")) {
-    url.replace("https://", "http://");
-    Serial.println("Artwork: Qobuz HTTP endpoint");
-  }
+
   for (int redirects = 0; redirects < 4; ++redirects) {
-    // This PlatformIO Arduino package has no secure-client library.
+    // HTTPS covers use the same local TLS client as chip-aware control.
     // TuneIn A31 test artwork was verified to return HTTP 200 directly.
-    if (!url.startsWith("http://")) return false;
-    WiFiClient plain;
+    if (!url.startsWith("http://") && !url.startsWith("https://")) return false;
+    WiFiClient plain; WiFiClientSecure secure;
+    secure.setInsecure(); secure.setHandshakeTimeout(2);
     HTTPClient http;
     http.setConnectTimeout(750);
     http.setTimeout(1800);
-    const bool began = http.begin(plain, url);
+    const bool began = url.startsWith("https://") ? http.begin(secure, url) : http.begin(plain, url);
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
@@ -491,24 +595,54 @@ void drawScreen();
 
 bool requestTo(const String& ip, const String& command, String& response,
                uint32_t timeoutMs = 1200) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  IPAddress target;
-  if (!target.fromString(ip)) return false;
-  HTTPClient http;
-  http.setConnectTimeout(350);
-  http.setTimeout(timeoutMs);
-  if (!http.begin(String("http://") + ip + "/httpapi.asp?command=" + command)) return false;
-  const int status = http.GET();
-  if (status == 200) response = http.getString();
-  http.end();
+  Endpoint endpoint;
+  bool known = false;
+  if (ip == deviceIp && activeEndpoint.chip != Chip::Unknown) { endpoint = activeEndpoint; known = true; }
+  if (!known) for (int i = 0; i < zoneCount; ++i) if (zones[i].ip == ip && zones[i].endpoint.chip != Chip::Unknown) { endpoint = zones[i].endpoint; known = true; break; }
+  if (!known) {
+    String statusBody;
+    if (!detectEndpoint(ip, endpoint, statusBody)) return false;
+    if (ip == deviceIp) applyEndpoint(endpoint);
+    if (command == "getStatusEx") { response = statusBody; if (ip == deviceIp) lastA31ActivityAt = millis(); return true; }
+  }
+  const bool ok = readEndpoint(ip, endpoint, command, response, timeoutMs);
   if (ip == deviceIp) lastA31ActivityAt = millis();
-  return status == 200 && response.indexOf("unknown command") < 0 &&
-         response.indexOf("unknown comman") < 0;
+  return ok;
 }
 
-bool request(const String& command, String& response) {
-  return requestTo(deviceIp, command, response);
+String sourceMode(const String& name) {
+  if (isCloud()) return name;
+  if (name == "Network") return "wifi";
+  if (name == "Bluetooth") return "bluetooth";
+  if (name == "AUX In" || name == "LineIn" || name == "RCA In") return "line-in";
+  if (name == "USB Disk") return "udisk";
+  if (name == "Optical In" || name == "OpticalIn") return "optical";
+  if (name == "RCA 2 In") return "line-in2";
+  if (name == "USB DAC" || name == "USBDAC") return "PCUSB";
+  if (name == "HDMI ARC") return "HDMI";
+  return "";
 }
+void readSourceCapabilities(JsonVariantConst info) {
+  JsonArrayConst list = info["DevFunction"].as<JsonArrayConst>();
+  if (list.isNull()) return;
+  discoveredSourceCount = 0; sourceCapabilitiesKnown = true;
+  for (JsonVariantConst item : list) {
+    const String name = item.as<String>(); const String mode = sourceMode(name);
+    if (mode.length() && discoveredSourceCount < 12) {
+      discoveredSourceNames[discoveredSourceCount] = name;
+      discoveredSourceModes[discoveredSourceCount++] = mode;
+    }
+  }
+}
+bool request(const String& command, String& response) {
+  const bool ok = requestTo(deviceIp, command, response);
+  if (ok && command == "getStatusEx") {
+    DynamicJsonDocument info(12288);
+    if (!deserializeJson(info, response)) readSourceCapabilities(info.as<JsonVariantConst>());
+  }
+  return ok;
+}
+
 
 bool refreshGroupStatus() {
   String body;
@@ -519,17 +653,17 @@ bool refreshGroupStatus() {
     if (wasSlave && menuScreen == MenuScreen::Player) drawScreen();
     return false;
   }
-  DynamicJsonDocument doc(4096);
+  DynamicJsonDocument doc(12288);
   if (deserializeJson(doc, body)) {
     const bool wasSlave = groupKnown && isSlave;
     groupKnown = false;
     if (wasSlave && menuScreen == MenuScreen::Player) drawScreen();
     return false;
   }
-  const String nextMaster = doc["master_ip"].as<String>();
-  const String nextGroup = doc["group"].as<String>();
+  const String nextMaster = isCloud() ? String(doc["Host"] | "0") : doc["master_ip"].as<String>();
+  const String nextGroup = isCloud() ? String(doc["MultiroomStatus"] | "free") : doc["group"].as<String>();
   // A31 may retain a master_ip after leaving. group=0 reports that it is free.
-  const bool ungrouped = nextGroup == "0";
+  const bool ungrouped = nextGroup == "0" || nextGroup == "free" || nextGroup == "none";
   const bool nextSlave = !ungrouped && nextMaster.length() && nextMaster != "0" &&
                          nextMaster != "0.0.0.0" && nextMaster != deviceIp;
   const bool changed = !groupKnown || isSlave != nextSlave || masterIp != nextMaster ||
@@ -546,13 +680,29 @@ bool refreshGroupStatus() {
 
 void pollDevice() {
   String body;
-  if (!request("getPlayerStatus", body)) {
+  if (activeEndpoint.chip == Chip::Unknown && !request("getStatusEx", body)) { deviceOnline = false; return; }
+  if (!request(isCloud() ? "getStatusEx" : "getPlayerStatus", body)) {
     deviceOnline = false;
     return;
   }
-  StaticJsonDocument<2048> doc;
+  DynamicJsonDocument doc(12288);
   if (deserializeJson(doc, body)) {
     deviceOnline = false;
+    return;
+  }
+  if (isCloud()) {
+    JsonVariant alt = doc["AllMate"]; if (alt.isNull()) alt = doc["AltMate"];
+    String state = String(doc["PlayState"] | ""); if (state.isEmpty()) state = String(alt["PlayState"] | ""); state.toLowerCase();
+    const bool newPlaying = state == "play" || state == "playing";
+    const int remoteVolume = doc["DevVolumeL"].as<int>();
+    String muteState = String(doc["VolumeState"] | ""); muteState.toLowerCase(); muted = muteState == "mute";
+    const String title = String(alt["TrackTitle"] | ""), artist = String(alt["TrackArtist"] | "");
+    bool changed = !deviceOnline || playing != newPlaying || title != trackTitle || artist != trackArtist;
+    if (title != trackTitle) { artworkReady = artworkAttempted = false; currentArtworkUrl = ""; lastArtworkPollAt = millis() - kArtworkPollMs; }
+    trackTitle = title; trackArtist = artist; reportedArtworkUrl = String(alt["TrackImage"] | "");
+    playing = newPlaying; deviceOnline = true;
+    if (!volumeDirty && !doc["DevVolumeL"].isNull() && remoteVolume >= 0 && remoteVolume <= 100) { changed |= volume != remoteVolume; volume = remoteVolume; }
+    if (changed && menuScreen == MenuScreen::Player) drawScreen();
     return;
   }
   const char* state = doc["status"] | "";
@@ -803,7 +953,8 @@ int menuCount() {
   switch (menuScreen) {
     case MenuScreen::Home: return 5;
     case MenuScreen::Presets: return 10;
-    case MenuScreen::Source: return 7;
+    case MenuScreen::Source: return sourceCapabilitiesKnown ? discoveredSourceCount : activeEndpoint.chip == Chip::A31 ? 7 : isCloud() ? 5 : 3;
+    case MenuScreen::EqBands: return 12;
     case MenuScreen::Multiroom: return 4;
     case MenuScreen::Join: return max(1, zoneCount - 1);
     case MenuScreen::Zone: return zoneCount + 1;  // Last item starts/resumes discovery.
@@ -820,7 +971,7 @@ String menuLabel(int item) {
   switch (menuScreen) {
     case MenuScreen::Home: return kHomeItems[item];
     case MenuScreen::Presets: return String(item + 1) + " " + kPresetNames[item];
-    case MenuScreen::Source: return kSourceItems[item];
+    case MenuScreen::Source: return sourceCapabilitiesKnown ? discoveredSourceNames[item] : isCloud() && item == 4 ? "HDMI ARC" : kSourceItems[item];
     case MenuScreen::Multiroom: return kMultiroomItems[item];
     case MenuScreen::Join: {
       const int i = joinZoneIndex(item);
@@ -828,7 +979,7 @@ String menuLabel(int item) {
     }
     case MenuScreen::Zone:
       return item < zoneCount ?
-          String(zones[item].ip == deviceIp ? "* " : "") + zones[item].name + " " +
+          String(zones[item].ip == deviceIp ? "* " : "") + zones[item].name + " " + chipName(zones[item].endpoint.chip) + " " +
               zones[item].ip.substring(zones[item].ip.lastIndexOf('.') + 1) :
           String("Find zones");
     case MenuScreen::Settings:
@@ -848,6 +999,10 @@ String menuLabel(int item) {
       return String(item == 0 ? "Bass " : item == 1 ? "Mid " : "Treble ") +
           (toneKnown[item] ? String(toneRaw[item] - (item == 1 ? 0 : 5)) + " dB" : "--");
     case MenuScreen::EqPresets: return kEqItems[item];
+    case MenuScreen::EqBands:
+      if (item == 11) return "Refresh";
+      if (item == 10) return graphicEnabled ? "EQ OFF" : "EQ ON";
+      return String(kBandNames[item]) + " " + (graphicKnown ? String(isCloud() ? graphicBands[item] : graphicBands[item] - 50) : "--");
     case MenuScreen::LeaveConfirm: return item ? "YES, LEAVE" : "CANCEL";
     default: return "";
   }
@@ -864,6 +1019,7 @@ const char* menuTitle() {
     case MenuScreen::Settings: return "SETTINGS";
     case MenuScreen::EqPresets: return "EQ PRESETS";
     case MenuScreen::ToneList: return "TONE";
+    case MenuScreen::EqBands: return "GRAPHIC EQ";
     case MenuScreen::LeaveConfirm: return "LEAVE GROUP?";
     default: return "";
   }
@@ -923,7 +1079,7 @@ void drawScanScreen() {
   const String progress = scanPhase == 1 ? String("SSDP") : String(scanHost - 1) + "/254";
   drawWindow(progress, 40, 96, 8, 2, 0, TFT_WHITE, TFT_BLACK);
   display.setTextSize(1);
-  drawWindow(String(zoneCount) + " A31 FOUND", 40, 149, 16, 1, 0, TFT_WHITE, TFT_BLACK);
+  drawWindow(String(zoneCount) + " ZONES FOUND", 40, 149, 16, 1, 0, TFT_WHITE, TFT_BLACK);
   drawWindow("HOLD: STOP", 65, 198, 11, 1, 0, accentColor(), TFT_BLACK);
 }
 
@@ -942,6 +1098,14 @@ void drawScreen() {
   if (menuScreen == MenuScreen::DeviceInfo || menuScreen == MenuScreen::NetworkInfo ||
       menuScreen == MenuScreen::MemoryInfo) {
     drawInformation(); return;
+  }
+  if (menuScreen == MenuScreen::EqBandEdit) {
+    display.fillScreen(TFT_BLACK);
+    drawWindow(kBandNames[editingBand], 45, 46, 15, 1, 0, TFT_WHITE, TFT_BLACK);
+    drawWindow(String(isCloud() ? editingBandValue : editingBandValue - 50), 30, 94, 9, 2, 0, TFT_WHITE, TFT_BLACK);
+    drawWindow(toneMessage.length() ? toneMessage : "PRESS: SAVE", 35, 169, 15, 1, 0, accentColor(), TFT_BLACK);
+    drawWindow("HOLD: CANCEL", 45, 199, 15, 1, 0, accentColor(), TFT_BLACK);
+    return;
   }
   if (menuScreen == MenuScreen::ToneEdit) {
     display.fillScreen(TFT_BLACK);
@@ -1056,7 +1220,7 @@ void webPage(const String& notice = "") {
     "button,a{display:inline-block;background:#ff9f0a;color:#000;border:0;border-radius:7px;padding:10px 14px;font-weight:700;text-decoration:none}"
     "p,small{color:#aaa}label{display:block}</style><h1>airControl KNOB</h1>");
   page += "<p>Firmware " + String(kFirmwareVersion) + " · KNOB " + WiFi.localIP().toString() +
-          " · A31 " + htmlEscape(deviceIp) + " · " +
+          " · " + String(chipName(activeEndpoint.chip)) + " " + htmlEscape(deviceIp) + " · " +
           (groupKnown ? (isSlave ? "Slave" : "Independent / Master") : "Group unknown") + "</p>";
   page += "<p>Group: " + htmlEscape(groupValue) + " · master_ip: " + htmlEscape(masterIp) + "</p>";
   if (notice.length()) page += "<section>" + htmlEscape(notice) + "</section>";
@@ -1064,7 +1228,7 @@ void webPage(const String& notice = "") {
 <button id="zone-search" type="button">Найти зоны</button><p id="zone-status"></p>
 <select id="zone-list" style="width:100%;padding:12px;background:#161616;color:white;margin:12px 0"></select>
 <button id="zone-select" type="button" disabled>Выбрать зону</button>
-<p>Поиск совместимых A31. Выбранная зона сохраняется без перезагрузки KNOB.</p></section>
+<p>Поиск A31, A97, A98 и A33. Выбранная зона сохраняется без перезагрузки KNOB.</p></section>
 <script>
 let zoneTimer;
 const byId=id=>document.getElementById(id);
@@ -1073,7 +1237,7 @@ async function loadZones(){
   const r=await fetch('/zones',{cache:'no-store'});if(!r.ok)throw Error('Не удалось получить список');
   const d=await r.json(),list=byId('zone-list'),old=list.value;
   list.replaceChildren();
-  for(const z of d.zones){const o=document.createElement('option');o.value=z.ip;o.textContent=z.name+' — '+z.ip;list.append(o);}
+  for(const z of d.zones){const o=document.createElement('option');o.value=z.ip;o.textContent=z.name+' · '+z.chip+' · '+z.ip;list.append(o);}
   if(d.zones.some(z=>z.ip===old))list.value=old;else list.value=d.current;
   byId('zone-current').textContent='Выбрана зона: '+d.current;
   byId('zone-status').textContent=d.scanning?'Идёт поиск… '+d.progress+'/254':'Найдено зон: '+d.zones.length;
@@ -1159,6 +1323,9 @@ void startSettingsWeb() {
       JsonObject zone = list.createNestedObject();
       zone["name"] = zones[i].name;
       zone["ip"] = zones[i].ip;
+      zone["chip"] = chipName(zones[i].endpoint.chip);
+      zone["protocol"] = zones[i].endpoint.tls ? "https" : "http";
+      zone["port"] = zones[i].endpoint.port;
     }
     String body; serializeJson(doc, body);
     settingsServer.send(200, "application/json; charset=utf-8", body);
@@ -1176,7 +1343,11 @@ void startSettingsWeb() {
     for (int i = 0; i < zoneCount; ++i) if (zones[i].ip == ip) found = i;
     if (found < 0) { settingsServer.send(400, "text/plain", "Zone not found"); return; }
     deviceIp = zones[found].ip;
+    applyEndpoint(zones[found].endpoint);
     settings.putString("device", deviceIp);
+    settings.putUChar("chip", uint8_t(activeEndpoint.chip));
+    settings.putUShort("port", activeEndpoint.port);
+    settings.putBool("tls", activeEndpoint.tls);
     a31Tcp.stop(); tcpInputLength = 0; lastTcpAttemptAt = 0;
     groupKnown = isSlave = deviceOnline = volumeDirty = false;
     masterIp = groupValue = trackTitle = trackArtist = currentArtworkUrl = "";
@@ -1209,6 +1380,7 @@ void startSettingsWeb() {
       settings.putString("mask", mask.toString()); settings.putString("dns", dns.toString());
     }
     settings.putString("device", device.toString());
+    settings.putUChar("chip", 0);
     settingsServer.send(200, "text/plain; charset=utf-8", "Saved. KNOB is restarting; reconnect at the new IP.");
     rebootAfterResponse = true;
   });
@@ -1251,7 +1423,7 @@ void startSettingsWeb() {
 
 void setMenu(MenuScreen screen) {
   if (screen == MenuScreen::Zone && zoneCount == 0) {
-    zones[0] = ZoneInfo{deviceIp, "A31", ""};
+    zones[0] = ZoneInfo{deviceIp, chipName(activeEndpoint.chip), "", activeEndpoint};
     zoneCount = 1;
   }
   menuScreen = screen;
@@ -1286,22 +1458,20 @@ bool localIp(const String& ipText) {
 }
 
 void rememberZone(const String& ip) {
-  if (zoneCount >= 8 || !localIp(ip)) return;
-  for (int i = 0; i < zoneCount; ++i) if (zones[i].ip == ip) return;
-  String body;
-  if (!requestTo(ip, "getStatusEx", body, 650)) return;
-  DynamicJsonDocument info(4096);
-  if (deserializeJson(info, body)) return;
-  const String hardware = info["hardware"] | "";
-  const String project = info["project"] | "";
-  // A97/A98 need HTTPS; this build's secure-client is unavailable.
-  if (hardware != "A31" && project.indexOf("UP2STREAM_PRO_V4") < 0) return;
-  ZoneInfo& zone = zones[zoneCount++];
-  zone.ip = ip;
-  zone.name = String(info["DeviceName"] | "A31");
-  if (zone.name.isEmpty()) zone.name = "A31";
+  if (zoneCount >= kMaxZones || !localIp(ip)) return;
+  for (int i = 0; i < zoneCount; ++i) if (zones[i].ip == ip && zones[i].endpoint.chip != Chip::Unknown) return;
+  Endpoint endpoint; String body;
+  if (!detectEndpoint(ip, endpoint, body)) return;
+  DynamicJsonDocument info(12288); if (deserializeJson(info, body)) return;
+  int index = -1;
+  for (int i = 0; i < zoneCount; ++i) if (zones[i].ip == ip) index = i;
+  if (index < 0) index = zoneCount++;
+  ZoneInfo& zone = zones[index];
+  zone.ip = ip; zone.endpoint = endpoint;
+  zone.name = endpoint.chip == Chip::A33 ? String(info["UserDevName"] | info["DevName"] | "A33") : String(info["DeviceName"] | chipName(endpoint.chip));
   zone.uuid = normalizedUuid(String(info["uuid"] | ""));
-  Serial.printf("Zone discovered: %s at %s\n", zone.name.c_str(), ip.c_str());
+  if (ip == deviceIp) { if (activeEndpoint.chip != endpoint.chip || activeEndpoint.port != endpoint.port) applyEndpoint(endpoint); readSourceCapabilities(info.as<JsonVariantConst>()); }
+  Serial.printf("Zone: %s %s %s:%u\n", zone.name.c_str(), chipName(endpoint.chip), ip.c_str(), endpoint.port);
 }
 
 void discoverZones(bool keepMenuVisible) {
@@ -1317,13 +1487,14 @@ void discoverZones(bool keepMenuVisible) {
   zoneCount = 0;
   rememberZone(current);
   if (zoneCount == 0) {
-    zones[0] = ZoneInfo{current, "A31", ""};
+    zones[0] = ZoneInfo{current, chipName(activeEndpoint.chip), "", activeEndpoint};
     zoneCount = 1;
   }
   scanInBackground = keepMenuVisible;
   if (!keepMenuVisible) { menuScreen = MenuScreen::Scan; selectedItem = 0; }
   menuMessage = "SEARCHING";
-  scanHost = 1;
+  scanHost = 1; scanPortIndex = 0;
+  cloudDiscoveryUdp.begin(53308);
   scanStartedAt = millis();
   scanPhase = 1;
   if (discoveryUdp.begin(0)) {
@@ -1339,6 +1510,12 @@ void discoverZones(bool keepMenuVisible) {
 
 void pollZoneScan() {
   if (!scanPhase) return;
+  for (int i = 0; i < 2; ++i) {
+    const int length = cloudDiscoveryUdp.parsePacket(); if (length <= 0) break;
+    const String ip = cloudDiscoveryUdp.remoteIP().toString();
+    while (cloudDiscoveryUdp.available()) cloudDiscoveryUdp.read();
+    rememberZone(ip);
+  }
   if (menuScreen != MenuScreen::Scan &&
       !(scanInBackground && menuScreen == MenuScreen::Zone)) {
     discoveryUdp.stop();
@@ -1357,18 +1534,17 @@ void pollZoneScan() {
     discoveryUdp.stop();
     scanPhase = 2;
   }
-  if (scanPhase == 2 && scanHost <= 254 && zoneCount < 8) {
+  if (scanPhase == 2 && scanHost <= 254 && zoneCount < kMaxZones) {
     const IPAddress ours = WiFi.localIP();
-    const String ipText = IPAddress(ours[0], ours[1], ours[2], scanHost++).toString();
-    if (ipText != deviceIp && ipText != ours.toString() && localIp(ipText)) {
-      WiFiClient probe;
-      IPAddress ip;
-      ip.fromString(ipText);
-      if (probe.connect(ip, 80, 110)) {
-        probe.stop();
-        rememberZone(ipText);
-      }
+    const String ipText = IPAddress(ours[0], ours[1], ours[2], scanHost).toString();
+    const uint16_t ports[] = {80, 443, 8000, 8443};
+    bool known = ipText == ours.toString() || !localIp(ipText);
+    for (int i = 0; i < zoneCount; ++i) if (zones[i].ip == ipText && zones[i].endpoint.chip != Chip::Unknown) known = true;
+    if (!known) {
+      WiFiClient probe; IPAddress ip; ip.fromString(ipText);
+      if (probe.connect(ip, ports[scanPortIndex], 70)) { probe.stop(); rememberZone(ipText); }
     }
+    if (known || ++scanPortIndex >= 4) { scanPortIndex = 0; ++scanHost; }
     if (scanHost % 8 == 0) {
       if (scanInBackground) menuMessage = String(scanHost - 1) + "/254";
       if (scanInBackground) drawMenu();
@@ -1377,9 +1553,10 @@ void pollZoneScan() {
     return;
   }
   scanPhase = 0;
+  cloudDiscoveryUdp.stop();
   if (!scanInBackground) menuScreen = scanReturnScreen;
   selectedItem = 0;
-  menuMessage = String(zoneCount) + " A31 FOUND";
+  menuMessage = String(zoneCount) + " ZONES FOUND";
   if (scanInBackground) drawMenu();
   else drawScreen();
 }
@@ -1387,14 +1564,14 @@ void pollZoneScan() {
 bool openInformation(MenuScreen screen) {
   String body;
   if (!request("getStatusEx", body)) { menuMessage = "DEVICE OFF"; return false; }
-  DynamicJsonDocument doc(4096);
+  DynamicJsonDocument doc(12288);
   if (deserializeJson(doc, body)) { menuMessage = "STATUS ERROR"; return false; }
   infoLineCount = 5;
   if (screen == MenuScreen::DeviceInfo) {
-    infoLines[0] = "NAME " + String(doc["DeviceName"] | "A31");
-    infoLines[1] = "MODEL " + String(doc["hardware"] | "A31");
-    infoLines[2] = "FW " + String(doc["firmware"] | "?");
-    infoLines[3] = "PROJECT " + String(doc["project"] | "?");
+    infoLines[0] = "NAME " + (isCloud() ? String(doc["UserDevName"] | doc["DevName"] | "A33") : String(doc["DeviceName"] | "?"));
+    infoLines[1] = "CHIP " + String(chipName(activeEndpoint.chip));
+    infoLines[2] = "FW " + (isCloud() ? String(doc["VERSION"] | "?") : String(doc["firmware"] | "?"));
+    infoLines[3] = "PROJECT " + (isCloud() ? String(doc["ProjectName"] | "?") : String(doc["project"] | "?"));
     infoLines[4] = "IP " + deviceIp;
   } else {
     infoLines[0] = "ZONE IP " + deviceIp;
@@ -1408,6 +1585,11 @@ bool openInformation(MenuScreen screen) {
 }
 
 bool sendA31EqPreset(int index) {
+  if (activeEndpoint.chip == Chip::A98 || activeEndpoint.chip == Chip::A97) {
+    const char* names[] = {"Flat", "Classical", "Pop", "Jazz", "Rock", "Vocal Booster"};
+    String body; return request("EQLoad:" + String(names[index]), body);
+  }
+  if (isCloud()) return false;
   return mcuCommand("MCU+PAS+RAKOIT:EQS:" + String(index) + "&");
 }
 
@@ -1463,6 +1645,7 @@ void handleTcpMessage(const String& message) {
 }
 
 bool ensureA31Tcp() {
+  if (activeEndpoint.chip != Chip::A31 && activeEndpoint.chip != Chip::A33) return false;
   if (WiFi.status() != WL_CONNECTED) return false;
   if (a31TcpIp != deviceIp) {
     a31Tcp.stop();
@@ -1477,13 +1660,42 @@ bool ensureA31Tcp() {
   tcpInputLength = 0;
   a31Tcp.setTimeout(1);
   IPAddress target;
-  const bool connected = target.fromString(deviceIp) && a31Tcp.connect(target, 8899, 350);
-  if (connected) Serial.println("A31 TCP/8899 connected");
+  const bool connected = target.fromString(deviceIp) && a31Tcp.connect(target, isCloud() ? 1234 : 8899, 350);
+  if (connected) Serial.printf("%s TCP connected\n", chipName(activeEndpoint.chip));
   return connected;
 }
 
 void pollA31Tcp(String* reply = nullptr) {
   if (!a31Tcp.connected()) return;
+  if (isCloud()) {
+    // JSON events may be concatenated or fragmented; frame by braces, respecting strings.
+    static String previousIp;
+    static String event; static int depth = 0; static bool quoted = false, escaped = false;
+    if (previousIp != deviceIp) { previousIp = deviceIp; event = ""; depth = 0; quoted = escaped = false; }
+    int budget = 2048;
+    while (a31Tcp.available() && budget-- > 0) {
+      const char c = char(a31Tcp.read());
+      if (!depth) { if (c != '{') continue; event = ""; quoted = escaped = false; }
+      event += c;
+      if (quoted) { if (escaped) escaped = false; else if (c == '\\') escaped = true; else if (c == '"') quoted = false; }
+      else { if (c == '"') quoted = true; else if (c == '{') ++depth; else if (c == '}') --depth; }
+      if (event.length() > 8192) { event = ""; depth = 0; quoted = escaped = false; continue; }
+      if (!depth) {
+        DynamicJsonDocument doc(8192);
+        if (!deserializeJson(doc, event)) {
+          const String command = doc["cmd"] | "";
+          if (command == "volume" && !volumeDirty && !doc["level"].isNull()) {
+            const int n = doc["level"].as<int>(); if (n >= 0 && n <= 100) { volume = n; if (menuScreen == MenuScreen::Player) drawVolumeUpdate(); }
+          } else if (command == "mute") muted = String(doc["state"] | "") == "on";
+          else if (command == "play" || command == "pause") { playing = command == "play"; if (menuScreen == MenuScreen::Player) drawScreen(); }
+          else if (command == "play_info") lastPollAt = millis() - kPollIntervalMs;
+          deviceOnline = true;
+        }
+        event = "";
+      }
+    }
+    return;
+  }
   while (a31Tcp.available() && tcpInputLength < sizeof(tcpInput))
     tcpInput[tcpInputLength++] = uint8_t(a31Tcp.read());
   while (tcpInputLength >= 20) {
@@ -1522,6 +1734,19 @@ void pollA31Tcp(String* reply = nullptr) {
 // MCU commands use the same 20-byte envelope as EQ presets. Read replies are
 // framed too; ignore incomplete or malformed frames rather than guessing values.
 bool mcuCommand(const String& payload, String* reply) {
+  if (isCloud()) {
+    if (reply) return false;
+    String json;
+    if (payload.startsWith("MCU+VOL+")) json = "{\"cmd\":\"volume\",\"level\":" + String(payload.substring(8).toInt()) + "}";
+    else if (payload == "MCU+PLY-PUS") json = "{\"cmd\":\"pause\"}";
+    else if (payload == "MCU+PLY-PLA") json = "{\"cmd\":\"play\"}";
+    else if (payload.startsWith("MCU+MUT+")) json = String("{\"cmd\":\"mute\",\"state\":\"") + (payload.endsWith("001") ? "on" : "off") + "\"}";
+    else return false;
+    if (!ensureA31Tcp()) return false;
+    json += '\n';
+    return a31Tcp.write(reinterpret_cast<const uint8_t*>(json.c_str()), json.length()) == json.length();
+  }
+  if (activeEndpoint.chip != Chip::A31) return false;
   if (!ensureA31Tcp()) return false;
   pollA31Tcp(); // Discard old replies before issuing a new request.
   if (lastTcpSentAt && millis() - lastTcpSentAt < 220)
@@ -1573,6 +1798,16 @@ bool parseTone(const String& reply, const char* key, int minimum, int maximum, i
 }
 
 bool readTone() {
+  if (isCloud()) {
+    String body; toneKnown[0] = toneKnown[1] = toneKnown[2] = false;
+    if (!request("getEqInfo:1", body)) return false;
+    DynamicJsonDocument doc(3072); if (deserializeJson(doc, body)) return false;
+    JsonVariant data = doc["data"]; if (data.isNull()) data = doc.as<JsonVariant>();
+    toneKnown[0] = !data["Bass"].isNull(); toneKnown[2] = !data["Treble"].isNull();
+    toneRaw[0] = data["Bass"].as<int>() + 5; toneRaw[2] = data["Treble"].as<int>() + 5;
+    return toneKnown[0] && toneKnown[2];
+  }
+  if (activeEndpoint.chip != Chip::A31) return false;
   String eq, mid;
   const bool eqOk = mcuCommand("MCU+PAS+EQGet&", &eq);
   const bool midOk = mcuCommand("MCU+PAS+RAKOIT:MID&", &mid);
@@ -1583,6 +1818,7 @@ bool readTone() {
 }
 
 bool readVirtualBass() {
+  if (activeEndpoint.chip != Chip::A31) { virtualBassKnown = false; return false; }
   String reply;
   int value = 0;
   virtualBassKnown = mcuCommand("MCU+PAS+RAKOIT:VBS&", &reply) &&
@@ -1600,6 +1836,14 @@ bool writeVirtualBass() {
 }
 
 bool saveTone() {
+  if (isCloud()) {
+    if (editingTone == 1) return false;
+    const int bass = editingTone == 0 ? editingRaw - 5 : toneRaw[0] - 5;
+    const int treble = editingTone == 2 ? editingRaw - 5 : toneRaw[2] - 5;
+    String body;
+    const String payload = "{\"Bass\":\"" + String(bass) + "\",\"Treble\":\"" + String(treble) + "\"}";
+    return request("setEqHighAndLowFrequencies:" + payload, body) && readTone() && toneRaw[editingTone] == editingRaw;
+  }
   const String command = editingTone == 1 ?
       "MCU+PAS+RAKOIT:MID:" + String(editingRaw) + "&" :
       "MCU+PAS+EQSet:" + String(editingTone == 0 ? "bass:" : "treble:") +
@@ -1618,12 +1862,44 @@ bool saveTone() {
   return verified && actual == editingRaw;
 }
 
+bool readGraphicEq() {
+  String body; graphicKnown = false;
+  if (!request(isCloud() ? "getEqInfo:2" : "EQGetBand", body)) return false;
+  DynamicJsonDocument doc(4096); if (deserializeJson(doc, body)) return false;
+  JsonArray list = isCloud() ? doc["EqBand"].as<JsonArray>() : doc["EQBand"].as<JsonArray>();
+  if (list.isNull() || list.size() != 10) return false;
+  bool seen[10] = {};
+  for (int i = 0; i < 10; ++i) {
+    const int index = isCloud() ? i : list[i]["index"].as<int>();
+    if (index < 0 || index >= 10 || seen[index] || (!isCloud() && list[i]["value"].isNull())) return false;
+    const int value = isCloud() ? list[i].as<int>() : list[i]["value"].as<int>();
+    if (value < (isCloud() ? -12 : 0) || value > (isCloud() ? 12 : 99)) return false;
+    seen[index] = true; graphicBands[index] = value;
+  }
+  graphicEnabled = isCloud() ? true : String(doc["EQStat"] | "") == "on";
+  graphicKnown = true; return true;
+}
+bool saveGraphicBand() {
+  StaticJsonDocument<1024> doc;
+  if (isCloud()) {
+    doc["Custom"] = "1"; doc["Name"] = "airControl";
+    JsonArray list = doc.createNestedArray("EqBand");
+    for (int i = 0; i < 10; ++i) list.add(String(i == editingBand ? editingBandValue : graphicBands[i]));
+  } else {
+    JsonObject band = doc.createNestedArray("EQBand").createNestedObject();
+    band["index"] = editingBand; band["param_name"] = kBandParams[editingBand]; band["value"] = editingBandValue;
+  }
+  String payload, body; serializeJson(doc, payload);
+  if (!request((isCloud() ? "setPresetEq:" : "EQSetBand:") + payload, body)) return false;
+  return readGraphicEq() && graphicBands[editingBand] == editingBandValue;
+}
 void chooseMenuItem() {
   String body;
   switch (menuScreen) {
     case MenuScreen::Home: {
       const MenuScreen pages[] = {MenuScreen::Presets, MenuScreen::Source,
           MenuScreen::Multiroom, MenuScreen::Zone, MenuScreen::Settings};
+      if (pages[selectedItem] == MenuScreen::Source) { String status; request("getStatusEx", status); }
       setMenu(pages[selectedItem]);
       // Opening a menu must be immediate and must not start a blocking /24
       // network scan. Find zones is an explicit action inside both menus.
@@ -1637,7 +1913,7 @@ void chooseMenuItem() {
         char command[16];
         snprintf(command, sizeof(command), "MCU+KEY+%03d", selectedItem + 1);
         if (mcuCommand(command) ||
-            request("MCUKeyShortClick:" + String(selectedItem + 1), body)) {
+            request((isCloud() ? "setPlayerCmd:playPreset:" : "MCUKeyShortClick:") + String(selectedItem + 1), body)) {
         menuScreen = MenuScreen::Player;
         artworkReady = artworkAttempted = false;
         currentArtworkUrl = "";
@@ -1651,7 +1927,7 @@ void chooseMenuItem() {
       menuMessage = "PRESET FAILED";
       break;
     case MenuScreen::Source:
-      menuMessage = request("setPlayerCmd:switchmode:" + String(kSourceModes[selectedItem]), body)
+      menuMessage = request("setPlayerCmd:switchmode:" + (sourceCapabilitiesKnown ? discoveredSourceModes[selectedItem] : isCloud() ? (selectedItem == 4 ? String("HDMI ARC") : String(kSourceItems[selectedItem])) : String(kSourceModes[selectedItem])), body)
                         ? "SOURCE SELECTED" : "SOURCE FAILED";
       if (menuMessage == "SOURCE SELECTED") {
         artworkReady = artworkAttempted = false;
@@ -1660,11 +1936,12 @@ void chooseMenuItem() {
       }
       break;
     case MenuScreen::Multiroom:
+      if (selectedItem == 2 && isCloud()) { menuMessage = refreshGroupStatus() ? (isSlave ? "SLAVE" : groupValue) : "STATUS ERROR"; break; }
       if (selectedItem == 0) { setMenu(MenuScreen::Join); return; }
       if (selectedItem == 1) { setMenu(MenuScreen::LeaveConfirm); return; }
       if (selectedItem == 3) { discoverZones(); return; }
       if (request("getStatusEx", body)) {
-        DynamicJsonDocument doc(4096);
+        DynamicJsonDocument doc(12288);
         if (!deserializeJson(doc, body)) {
           const String master = doc["master_ip"].as<String>();
           const String group = doc["group"].as<String>();
@@ -1676,6 +1953,13 @@ void chooseMenuItem() {
     case MenuScreen::Join: {
       const int target = joinZoneIndex(selectedItem);
       if (target < 0) { discoverZones(); break; }
+      if (zones[target].endpoint.chip == Chip::Unknown) { menuMessage = "FIND ZONES FIRST"; break; }
+      if ((zones[target].endpoint.chip == Chip::A33) != isCloud()) { menuMessage = "DIFFERENT FAMILY"; break; }
+      if (isCloud()) {
+        if (!refreshGroupStatus() || isSlave) { menuMessage = "SELECT MASTER"; break; }
+        menuMessage = request("multiroom:setHost", body) && requestTo(zones[target].ip, "multiroom:setSlave:" + deviceIp, body, 2500) ? "GROUPED" : "JOIN FAILED";
+        lastGroupPollAt = millis() - kGroupPollMs; break;
+      }
       int master = -1;
       for (int i = 0; i < zoneCount; ++i) if (zones[i].ip == deviceIp) master = i;
       String masterBody, peerBody;
@@ -1714,6 +1998,10 @@ void chooseMenuItem() {
     case MenuScreen::Zone:
       if (selectedItem >= zoneCount) { discoverZones(); break; }
       deviceIp = zones[selectedItem].ip;
+      applyEndpoint(zones[selectedItem].endpoint);
+      settings.putString("device", deviceIp);
+      settings.putUChar("chip", uint8_t(activeEndpoint.chip));
+      settings.putUShort("port", activeEndpoint.port); settings.putBool("tls", activeEndpoint.tls);
       groupKnown = false;
       isSlave = false;
       masterIp = "";
@@ -1734,12 +2022,20 @@ void chooseMenuItem() {
             request("setPlayerCmd:mute:" + String(muted ? 0 : 1), body))
                           ? "MUTE UPDATED" : "MUTE FAILED";
         if (menuMessage == "MUTE UPDATED") muted = !muted;
-      } else if (selectedItem == 1) { setMenu(MenuScreen::EqPresets); return; }
+      } else if (selectedItem == 1) {
+        if (isCloud()) { readGraphicEq(); setMenu(MenuScreen::EqBands); return; }
+        setMenu(MenuScreen::EqPresets); return;
+      }
       else if (selectedItem == 2) {
+        if (activeEndpoint.chip == Chip::A97 || activeEndpoint.chip == Chip::A98) {
+          const bool ok = readGraphicEq(); setMenu(MenuScreen::EqBands);
+          if (!ok) { menuMessage = "EQ API UNAVAILABLE"; drawMenu(); }
+          return;
+        }
         const bool ok = readTone();
         const bool bassOk = readVirtualBass();
         setMenu(MenuScreen::ToneList);
-        if (!ok || !bassOk) { menuMessage = "READ FAILED"; drawMenu(); }
+        if (!ok || (activeEndpoint.chip == Chip::A31 && !bassOk)) { menuMessage = activeEndpoint.chip == Chip::A31 || isCloud() ? "READ FAILED" : "NO TONE API"; drawMenu(); }
         return;
       } else if (selectedItem == 3 || selectedItem == 4) {
         if (openInformation(selectedItem == 3 ? MenuScreen::DeviceInfo :
@@ -1757,6 +2053,21 @@ void chooseMenuItem() {
         return;
       } else { discoverZones(); return; }
       break;
+    case MenuScreen::EqBands:
+      if (selectedItem == 11) { menuMessage = readGraphicEq() ? "UPDATED" : "EQ API UNAVAILABLE"; break; }
+      if (!graphicKnown) { menuMessage = "REFRESH FIRST"; break; }
+      if (selectedItem == 10) {
+        const bool wanted = !graphicEnabled;
+        menuMessage = request(isCloud() ? String("eqEnable:") + (wanted ? "0010" : "0000") : wanted ? "EQOn" : "EQOff", body) ? "EQ SENT" : "EQ FAILED";
+        if (menuMessage == "EQ SENT") graphicEnabled = wanted;
+        break;
+      }
+      editingBand = selectedItem; editingBandValue = graphicBands[editingBand]; toneMessage = "";
+      setMenu(MenuScreen::EqBandEdit); return;
+    case MenuScreen::EqBandEdit:
+      if (saveGraphicBand()) { setMenu(MenuScreen::EqBands); selectedItem = editingBand; menuMessage = "SAVED"; drawMenu(); }
+      else { toneMessage = "SAVE FAILED"; drawScreen(); }
+      return;
     case MenuScreen::ToneList:
       if (selectedItem == 4) {
         const bool toneOk = readTone();
@@ -1765,12 +2076,13 @@ void chooseMenuItem() {
         break;
       }
       if (selectedItem == 3) {
-        if (!virtualBassKnown) menuMessage = "REFRESH FIRST";
+        if (activeEndpoint.chip != Chip::A31) menuMessage = "NOT SUPPORTED";
+        else if (!virtualBassKnown) menuMessage = "REFRESH FIRST";
         else menuMessage = writeVirtualBass() ? "CONFIRMED" : "SAVE FAILED";
         break;
       }
       if (!toneKnown[selectedItem]) {
-        menuMessage = "REFRESH FIRST";
+        menuMessage = isCloud() && selectedItem == 1 ? "NO MID API" : "REFRESH FIRST";
         break;
       }
       editingTone = selectedItem;
@@ -1791,11 +2103,11 @@ void chooseMenuItem() {
       }
       return;
     case MenuScreen::EqPresets:
-      menuMessage = sendA31EqPreset(selectedItem) ? "EQ SENT" : "EQ FAILED";
+      menuMessage = isCloud() ? "USE GRAPHIC EQ" : sendA31EqPreset(selectedItem) ? "EQ SENT" : "EQ FAILED";
       break;
     case MenuScreen::LeaveConfirm:
       if (selectedItem == 1) {
-        menuMessage = requestTo(deviceIp, "multiroom:LeaveGroup", body, 5000)
+        menuMessage = requestTo(deviceIp, isCloud() ? (isSlave ? "multiroom:disconnectSlave" : "multiroom:breakUp") : "multiroom:LeaveGroup", body, 5000)
                           ? "LEFT GROUP" : "LEAVE FAILED";
         if (menuMessage == "LEFT GROUP") {
           groupKnown = false;
@@ -1844,6 +2156,10 @@ void pollEncoder() {
     const int direction = encoderAccumulator > 0 ? 1 : -1;
     encoderAccumulator = 0;
     if (menuScreen == MenuScreen::Scan) return;
+    if (menuScreen == MenuScreen::EqBandEdit) {
+      editingBandValue = constrain(editingBandValue + direction, isCloud() ? -12 : 0, isCloud() ? 12 : 99);
+      toneMessage = ""; drawScreen(); return;
+    }
     if (menuScreen == MenuScreen::ToneEdit) {
       editingRaw = constrain(editingRaw + direction, editingTone == 1 ? -5 : 0,
                              editingTone == 1 ? 5 : 10);
@@ -1942,6 +2258,8 @@ void pollButton() {
       selectedItem = previous;
       drawMenu();
     }
+    else if (menuScreen == MenuScreen::EqBandEdit) { setMenu(MenuScreen::EqBands); selectedItem = editingBand; drawMenu(); }
+    else if (menuScreen == MenuScreen::EqBands) setMenu(MenuScreen::Settings);
     else if (menuScreen == MenuScreen::ToneList) setMenu(MenuScreen::Settings);
     else setMenu(MenuScreen::Home);
     encoderAccumulator = 0;
@@ -1983,6 +2301,9 @@ void setup() {
     }
   }
   deviceIp = settings.getString("device", "192.168.0.2");
+  activeEndpoint.chip = Chip(settings.getUChar("chip", 0));
+  activeEndpoint.port = settings.getUShort("port", 80);
+  activeEndpoint.tls = settings.getBool("tls", false);
   WiFi.mode(WIFI_STA);
   if (settings.getBool("fixed", false)) {
     IPAddress ip, gw, mask, dns;
@@ -2010,7 +2331,7 @@ void setup() {
     Serial.println("Wi-Fi setup timeout; reboot to try again");
   }
   drawScreen();
-  Serial.println("airControl KNOB v0.7.3: GitHub updates");
+  Serial.println("airControl KNOB v0.8.0: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }

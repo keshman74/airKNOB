@@ -1,13 +1,13 @@
 name: Build and publish KNOB firmware
 on:
   push:
-    branches: [main]
+    branches: [experimental/multichip-v0.8.0]
     paths: ['src/**', 'platformio.ini', '.github/workflows/firmware.yml', 'scripts/**']
   workflow_dispatch:
 permissions:
   contents: write
 concurrency:
-  group: knob-firmware-main
+  group: knob-firmware-multichip
   cancel-in-progress: false
 jobs:
   firmware:
@@ -24,12 +24,12 @@ jobs:
         with:
           name: airControl-KNOB-firmware
           path: firmware/
-      - name: Publish firmware to main
+      - name: Publish test firmware to experimental branch
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add firmware/
           if ! git diff --cached --quiet; then
             git commit -m "Publish firmware [skip ci]"
-            git push origin HEAD:main
+            git push origin HEAD:experimental/multichip-v0.8.0
           fi

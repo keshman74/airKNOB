@@ -1,3 +1,13 @@
+# airControl KNOB v0.8.0 — multi-chip test build
+
+A31 / A97 / A98 / A33 discovery and chip-aware adapters. Experimental branch: `experimental/multichip-v0.8.0`. Stable online channel remains main v0.7.3.
+
+Display: long press → Zone → Find zones. Web: Find zones → choose name/chip/IP → Select. Up to 20 local zones. Discovery checks one port per loop and validates returned device identity, not just an open socket. Search is on demand; no constant subnet scanning.
+
+Sources are read from DevFunction when available. A31 tone/Virtual Bass preserved. A33 bass/treble and 10-band graphic EQ; A98 10-band EQ; A97 EQ only if its API actually returns a supported band layout. Unknown chip features are shown unavailable and not sent using A31 commands.
+
+Hardware verification of the new KNOB adapters is pending. See docs/airControl_PROTOCOL_REFERENCE.md for evidence and limits. Install by local firmware.bin upload first. Online main channel is not changed.
+
 # airControl KNOB v0.7.3
 
 Repository: https://github.com/keshman74/airKNOB
