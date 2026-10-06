@@ -2,7 +2,7 @@ name: Build and publish KNOB firmware
 on:
   push:
     branches: [experimental/multichip-v0.8.0]
-    paths: ['src/**', 'platformio.ini', '.github/workflows/firmware.yml', 'scripts/**']
+    paths: ['src/**', 'platformio.ini', '.github/workflows/firmware.yml', 'scripts/**', 'tests/**']
   workflow_dispatch:
 permissions:
   contents: write
@@ -18,6 +18,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install platformio==6.1.18
+      - run: node tests/web-zones.test.cjs
       - run: pio run
       - run: python3 scripts/publish_manifest.py
       - uses: actions/upload-artifact@v4

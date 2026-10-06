@@ -271,6 +271,14 @@ bool readEndpoint(const String& ip, const Endpoint& endpoint, const String& comm
   const int status = http.GET();
   response = status == 200 ? http.getString() : "";
   http.end();
+  if (endpoint.chip == Chip::A33) {
+    String clean; clean.reserve(response.length());
+    for (size_t i = 0; i < response.length(); ++i) {
+      const uint8_t c = response[i]; if (c >= 32 || c == '\n' || c == '\r' || c == '\t') clean += char(c);
+    }
+    if (clean.startsWith("\xEF\xBB\xBF")) clean.remove(0, 3);
+    response = clean;
+  }
   return status == 200 && response.length() && response.indexOf("unknown comman") < 0;
 }
 bool detectEndpoint(const String& ip, Endpoint& endpoint, String& statusBody) {
@@ -396,7 +404,7 @@ String fetchArtworkAddress() {
     if (request("getMetaInfo", body)) {
       DynamicJsonDocument info(6144);
       if (!deserializeJson(info, body)) {
-        JsonVariant data = info["metaData"]; if (data.isNull()) data = info.as<JsonVariant>();
+        JsonVariant data = info["metaData"].isNull() ? info.as<JsonVariant>() : info["metaData"].as<JsonVariant>();
         const String title = String(data["title"] | ""), artist = String(data["artist"] | "");
         if (title.length() && (title != trackTitle || artist != trackArtist)) { trackTitle = title; trackArtist = artist; marqueeOffset = 0; marqueeStartedAt = millis(); }
         String art = String(data["albumArtURI"] | "");
@@ -691,7 +699,7 @@ void pollDevice() {
     return;
   }
   if (isCloud()) {
-    JsonVariant alt = doc["AllMate"]; if (alt.isNull()) alt = doc["AltMate"];
+    JsonVariant alt = doc["AllMate"].isNull() ? doc["AltMate"].as<JsonVariant>() : doc["AllMate"].as<JsonVariant>();
     String state = String(doc["PlayState"] | ""); if (state.isEmpty()) state = String(alt["PlayState"] | ""); state.toLowerCase();
     const bool newPlaying = state == "play" || state == "playing";
     const int remoteVolume = doc["DevVolumeL"].as<int>();
@@ -1265,7 +1273,7 @@ loadZones();
   page += "<label>Gateway<input name='gw' value='" + htmlEscape(gw) + "'></label>";
   page += "<label>Subnet mask<input name='mask' value='" + htmlEscape(mask) + "'></label>";
   page += "<label>DNS<input name='dns' value='" + htmlEscape(dns) + "'></label>";
-  page += "<label>A31 IP<input name='device' value='" + htmlEscape(deviceIp) + "'></label>";
+  page += "<label>Player IP<input name='device' value='" + htmlEscape(deviceIp) + "'></label>";
   page += F("<button type='submit'>Save and restart</button></form></section>"
     "<section><h2>Обновление прошивки</h2><p>Обновление файлом firmware.bin:</p>"
     "<form method='post' action='/update' enctype='multipart/form-data'>"
@@ -1314,12 +1322,13 @@ void discoverZones(bool keepMenuVisible = false);
 void startSettingsWeb() {
   settingsServer.on("/", HTTP_GET, []() { webPage(); });
   settingsServer.on("/zones", HTTP_GET, []() {
-    DynamicJsonDocument doc(3072);
+    DynamicJsonDocument doc(8192);
     doc["scanning"] = bool(scanPhase || webScanRequested);
     doc["current"] = deviceIp;
     doc["progress"] = scanPhase == 1 ? 0 : min(scanHost - 1, 254);
     JsonArray list = doc.createNestedArray("zones");
     for (int i = 0; i < zoneCount; ++i) {
+      if (zones[i].endpoint.chip == Chip::Unknown) continue;
       JsonObject zone = list.createNestedObject();
       zone["name"] = zones[i].name;
       zone["ip"] = zones[i].ip;
@@ -1341,7 +1350,7 @@ void startSettingsWeb() {
     const String ip = settingsServer.arg("ip");
     int found = -1;
     for (int i = 0; i < zoneCount; ++i) if (zones[i].ip == ip) found = i;
-    if (found < 0) { settingsServer.send(400, "text/plain", "Zone not found"); return; }
+    if (found < 0 || zones[found].endpoint.chip == Chip::Unknown) { settingsServer.send(400, "text/plain", "Zone not found"); return; }
     deviceIp = zones[found].ip;
     applyEndpoint(zones[found].endpoint);
     settings.putString("device", deviceIp);
@@ -1362,7 +1371,7 @@ void startSettingsWeb() {
     IPAddress ip, gw, mask, dns, device;
     const bool fixed = settingsServer.hasArg("fixed");
     if (!parseIpField(settingsServer.arg("device"), device)) {
-      webPage("Invalid A31 IP; nothing saved"); return;
+      webPage("Invalid player IP; nothing saved"); return;
     }
     if (fixed && (!parseIpField(settingsServer.arg("ip"), ip) ||
                   !parseIpField(settingsServer.arg("gw"), gw) ||
@@ -1486,10 +1495,7 @@ void discoverZones(bool keepMenuVisible) {
   const String current = deviceIp;
   zoneCount = 0;
   rememberZone(current);
-  if (zoneCount == 0) {
-    zones[0] = ZoneInfo{current, chipName(activeEndpoint.chip), "", activeEndpoint};
-    zoneCount = 1;
-  }
+
   scanInBackground = keepMenuVisible;
   if (!keepMenuVisible) { menuScreen = MenuScreen::Scan; selectedItem = 0; }
   menuMessage = "SEARCHING";
@@ -1518,7 +1524,7 @@ void pollZoneScan() {
   }
   if (menuScreen != MenuScreen::Scan &&
       !(scanInBackground && menuScreen == MenuScreen::Zone)) {
-    discoveryUdp.stop();
+    discoveryUdp.stop(); cloudDiscoveryUdp.stop();
     scanPhase = 0;
     return;
   }
@@ -1802,7 +1808,7 @@ bool readTone() {
     String body; toneKnown[0] = toneKnown[1] = toneKnown[2] = false;
     if (!request("getEqInfo:1", body)) return false;
     DynamicJsonDocument doc(3072); if (deserializeJson(doc, body)) return false;
-    JsonVariant data = doc["data"]; if (data.isNull()) data = doc.as<JsonVariant>();
+    JsonVariant data = doc["data"].isNull() ? doc.as<JsonVariant>() : doc["data"].as<JsonVariant>();
     toneKnown[0] = !data["Bass"].isNull(); toneKnown[2] = !data["Treble"].isNull();
     toneRaw[0] = data["Bass"].as<int>() + 5; toneRaw[2] = data["Treble"].as<int>() + 5;
     return toneKnown[0] && toneKnown[2];
@@ -2213,7 +2219,7 @@ void pollButton() {
       String body;
       if (menuScreen == MenuScreen::Scan) {
         discoveryUdp.stop();
-        scanPhase = 0;
+        scanPhase = 0; cloudDiscoveryUdp.stop();
         setMenu(scanReturnScreen);
       } else if (menuScreen == MenuScreen::DeviceInfo || menuScreen == MenuScreen::NetworkInfo ||
                  menuScreen == MenuScreen::MemoryInfo) {
@@ -2242,7 +2248,7 @@ void pollButton() {
     longPressHandled = true;
     if (menuScreen == MenuScreen::Scan) {
       discoveryUdp.stop();
-      scanPhase = 0;
+      scanPhase = 0; cloudDiscoveryUdp.stop();
       setMenu(scanReturnScreen);
     } else if (menuScreen == MenuScreen::DeviceInfo || menuScreen == MenuScreen::NetworkInfo ||
                menuScreen == MenuScreen::MemoryInfo)
