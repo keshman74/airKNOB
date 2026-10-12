@@ -1,7 +1,7 @@
 {
-  "version": "0.8.8",
+  "version": "0.8.9",
   "board": "onx2424g013",
-  "size": 1293968,
-  "md5": "7684a5c4b550cb687b3550b9833d4433",
-  "url": "https://raw.githubusercontent.com/keshman74/airKNOB/experimental/multichip-v0.8.0/firmware/airControl-KNOB-v0.8.8.bin"
+  "size": 1294112,
+  "md5": "babb0c847b2a77b028b330c7ef05e1c2",
+  "url": "https://raw.githubusercontent.com/keshman74/airKNOB/experimental/multichip-v0.8.0/firmware/airControl-KNOB-v0.8.9.bin"
 }
