@@ -173,7 +173,7 @@ portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
 volatile int8_t encoderSteps[128];
 volatile uint8_t encoderRead = 0, encoderWrite = 0;
 void IRAM_ATTR captureEncoder() {
-  static const int8_t transitions[16] = {0,-1,1,0,1,0,0,-1,-1,0,0,1,0,1,-1,0};
+  static DRAM_ATTR const int8_t transitions[16] = {0,-1,1,0,1,0,0,-1,-1,0,0,1,0,1,-1,0};
   const uint8_t now = (digitalRead(kEncoderA) << 1) | digitalRead(kEncoderB);
   portENTER_CRITICAL_ISR(&encoderMux);
   encoderAccumulator += transitions[(encoderPrevious << 2) | now];
@@ -842,12 +842,12 @@ void drawVolumeLabel() {
   uint16_t rowPixels[120];
   for (int row=0; row<kGlyphHeight; ++row) {
     for (int x=0; x<width; ++x) {
-      const int local = x-origin;
+      const int glyphX = x-origin;
       bool ink = false;
-      if (local >= 0 && local < static_cast<int>(label.length())*kGlyphWidth) {
-        const int glyph = label[local/kGlyphWidth]-32;
+      if (glyphX >= 0 && glyphX < static_cast<int>(label.length())*kGlyphWidth) {
+        const int glyph = label[glyphX/kGlyphWidth]-32;
         const uint16_t bits = pgm_read_word(&kGlyphRows[glyph][row]);
-        ink = bits & (1U << (kGlyphWidth-1-local%kGlyphWidth));
+        ink = bits & (1U << (kGlyphWidth-1-glyphX%kGlyphWidth));
       }
       rowPixels[x] = ink ? accentColor() : TFT_BLACK;
     }
@@ -1958,13 +1958,13 @@ void chooseMenuItem() {
         snprintf(command, sizeof(command), "MCU+KEY+%03d", selectedItem + 1);
         if (mcuCommand(command) ||
             request((isCloud() ? "setPlayerCmd:playPreset:" : "MCUKeyShortClick:") + String(selectedItem + 1), body)) {
-        showFeedback(3);
         menuScreen = MenuScreen::Player;
         artworkReady = artworkAttempted = false;
         currentArtworkUrl = "";
         // Let A31 change tracks before fetching its artwork; volume stays live.
         lastArtworkPollAt = millis() - kArtworkPollMs + 2500;
-        pollDevice();
+        showFeedback(3);
+        lastPollAt = millis() - kFallbackPollIntervalMs;
         drawScreen();
         return;
         }
@@ -2258,10 +2258,11 @@ void pollButton() {
       } else if (menuScreen != MenuScreen::Player) {
         chooseMenuItem();
       } else {
-        const String command = playing ? "setPlayerCmd:pause" : "setPlayerCmd:resume";
-        const String tcpCommand = playing ? "MCU+PLY-PUS" : "MCU+PLY-PLA";
+        const bool requestedPlaying = !playing;
+        const String command = requestedPlaying ? "setPlayerCmd:resume" : "setPlayerCmd:pause";
+        const String tcpCommand = requestedPlaying ? "MCU+PLY-PLA" : "MCU+PLY-PUS";
         if (mcuCommand(tcpCommand) || request(command, body)) {
-          playing = !playing;
+          playing = requestedPlaying;
           showFeedback(playing ? 1 : 2);
           deviceOnline = true;
           Serial.println(playing ? "A31 PLAY" : "A31 PAUSE");
@@ -2372,6 +2373,7 @@ void setup() {
   } else {
     Serial.println("Wi-Fi setup timeout; reboot to try again");
   }
+  portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
   Serial.println("airControl KNOB v0.8.1: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
