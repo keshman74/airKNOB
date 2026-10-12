@@ -27,7 +27,8 @@ constexpr int kVolumePerDetent = 2;
 String deviceIp = "192.168.0.2";
 constexpr uint32_t kPollIntervalMs = 15000;
 constexpr uint32_t kFallbackPollIntervalMs = 4000;
-constexpr uint32_t kVolumeSendDelayMs = 350;
+constexpr uint32_t kVolumeSendDelayMs = 80;
+uint32_t lastVolumeSentAt = 0;
 constexpr uint32_t kVolumeRetryDelayMs = 2000;
 constexpr uint32_t kLongPressMs = 850;
 constexpr uint32_t kDimAfterMs = 30000;
@@ -39,7 +40,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.0";
+constexpr char kFirmwareVersion[] = "0.8.1";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -166,8 +167,28 @@ bool otaUploadFailed = false;
 bool otaUploadFinished = false;
 int volume = kInitialVolume;
 bool playing = false;
-uint8_t encoderPrevious = 0;
-int encoderAccumulator = 0;
+volatile uint8_t encoderPrevious = 0;
+volatile int encoderAccumulator = 0;
+portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
+volatile int8_t encoderSteps[128];
+volatile uint8_t encoderRead = 0, encoderWrite = 0;
+void IRAM_ATTR captureEncoder() {
+  static const int8_t transitions[16] = {0,-1,1,0,1,0,0,-1,-1,0,0,1,0,1,-1,0};
+  const uint8_t now = (digitalRead(kEncoderA) << 1) | digitalRead(kEncoderB);
+  portENTER_CRITICAL_ISR(&encoderMux);
+  encoderAccumulator += transitions[(encoderPrevious << 2) | now];
+  encoderPrevious = now;
+  if (encoderAccumulator >= 4 || encoderAccumulator <= -4) {
+    const uint8_t next = (encoderWrite + 1) & 127;
+    if (next != encoderRead) { encoderSteps[encoderWrite] = encoderAccumulator > 0 ? 1 : -1; encoderWrite = next; }
+    encoderAccumulator = 0;
+  }
+  portEXIT_CRITICAL_ISR(&encoderMux);
+}
+uint32_t feedbackUntil = 0;
+int feedbackKind = 0; // 1 play, 2 pause, 3 preset selected
+void showFeedback(int kind) { feedbackKind = kind; feedbackUntil = millis() + 2000; }
+
 bool buttonRawPrevious = HIGH;
 bool buttonStable = HIGH;
 uint32_t buttonChangedAt = 0;
@@ -762,11 +783,12 @@ void pollDevice() {
 }
 
 void sendVolumeWhenReady() {
-  if (!volumeDirty || millis() - volumeChangedAt < kVolumeSendDelayMs ||
+  if (!volumeDirty || millis() - lastVolumeSentAt < kVolumeSendDelayMs ||
       static_cast<int32_t>(millis() - volumeRetryAt) < 0) return;
   String body;
   char command[16];
   snprintf(command, sizeof(command), "MCU+VOL+%03d", volume);
+  lastVolumeSentAt = millis();
   const bool ok = mcuCommand(command) || request("setPlayerCmd:vol:" + String(volume), body);
   if (ok) {
     volumeDirty = false;
@@ -789,43 +811,53 @@ void sendVolumeWhenReady() {
 
 
 void drawVolumeArc() {
-  // Open horseshoe from the lower left, across the top, to the lower right.
-  constexpr float startDegrees = 160.0f;
-  // The two ends meet the same height, clear of artwork and metadata.
-  constexpr float sweepDegrees = 220.0f;
-  constexpr int segments = 100;
-  constexpr float centerX = 120.0f;
-  constexpr float centerY = 120.0f;
-  constexpr float radius = 108.0f;
-  constexpr int thickness = 9;
-  const int activeSegments = (volume * segments + 50) / 100;
-  const float middleRadius = radius + (thickness - 1) * .5f;
-  // Overlapping disks close every raster gap between angle samples. Drawing
-  // the active path second covers every inactive pixel inside the yellow arc.
-  const auto paint = [&](int lastSegment, uint16_t color) {
-    for (int i = 0; i <= lastSegment; ++i) {
-      const float a = (startDegrees + sweepDegrees * i / segments) * PI / 180.0f;
-      display.fillCircle(roundf(centerX + middleRadius * cosf(a)),
-                         roundf(centerY + middleRadius * sinf(a)),
-                         thickness / 2 + 1, color);
-    }
-  };
-  display.startWrite();
+  // Paint each arc pixel exactly once in its final colour: never grey then yellow.
   const uint16_t inactive = display.color565(55, 55, 55);
-  paint(segments, inactive);
-  if (activeSegments) paint(activeSegments, accentColor());
+  constexpr float r = 112.0f, half = 5.0f;
+  const float end = 220.0f * volume / 100.0f;
+  display.startWrite();
+  for (int y = 2; y < 239; ++y) {
+    int runStart = -1; uint16_t runColor = 0;
+    for (int x = 2; x <= 239; ++x) {
+      const float dx = x - 120.0f, dy = y - 120.0f;
+      const float distance2 = dx*dx + dy*dy;
+      const bool ring = distance2 >= (r-half)*(r-half) && distance2 <= (r+half)*(r+half);
+      float angle = ring ? atan2f(dy, dx) * 180.0f / PI - 160.0f : 360.0f;
+      if (angle < 0) angle += 360.0f;
+      const bool inside = x < 239 && ring && angle <= 220.0f;
+      const uint16_t color = volume > 0 && angle <= end ? accentColor() : inactive;
+      if (runStart >= 0 && (!inside || color != runColor)) {
+        display.fillRect(runStart, y, x-runStart, 1, runColor); runStart = -1;
+      }
+      if (inside && runStart < 0) { runStart = x; runColor = color; }
+    }
+  }
   display.endWrite();
 }
 
 void drawVolumeLabel() {
-  const int y = 210;
-  display.fillRect(60, y, 120, kGlyphHeight, TFT_BLACK);
-  drawUtf8Line("VOL " + String(volume) + "%", y, accentColor());
+  const String label = "VOL " + String(volume) + "%";
+  const int width = 120, left = 60, y = 210;
+  const int origin = (width - label.length()*kGlyphWidth)/2;
+  uint16_t rowPixels[120];
+  for (int row=0; row<kGlyphHeight; ++row) {
+    for (int x=0; x<width; ++x) {
+      const int local = x-origin;
+      bool ink = false;
+      if (local >= 0 && local < static_cast<int>(label.length())*kGlyphWidth) {
+        const int glyph = label[local/kGlyphWidth]-32;
+        const uint16_t bits = pgm_read_word(&kGlyphRows[glyph][row]);
+        ink = bits & (1U << (kGlyphWidth-1-local%kGlyphWidth));
+      }
+      rowPixels[x] = ink ? accentColor() : TFT_BLACK;
+    }
+    display.setSwapBytes(true); display.pushImage(left,y+row,width,1,rowPixels); display.setSwapBytes(false);
+  }
 }
 
 // Compose the whole 240x240 frame offscreen, then show it in one transfer.
 void drawVolumeUpdate() {
-  if (menuScreen == MenuScreen::Player) drawScreen();
+  if (menuScreen == MenuScreen::Player) { drawVolumeArc(); drawVolumeLabel(); }
 }
 
 void drawWindow(const String& value, int x, int y, int visible, int scale,
@@ -1150,6 +1182,12 @@ void drawScreen() {
   }
   drawMetadata();
   drawVolumeLabel();
+  if (feedbackKind && static_cast<int32_t>(feedbackUntil - millis()) > 0) {
+    display.fillRoundRect(65, 77, 110, 64, 10, TFT_BLACK);
+    if (feedbackKind == 3) drawWindow("SELECTED", 72, 100, 12, 1, 0, accentColor(), TFT_BLACK);
+    else if (feedbackKind == 2) { display.fillRect(101, 90, 10, 35, TFT_WHITE); display.fillRect(125, 90, 10, 35, TFT_WHITE); }
+    else for (int x=104; x<=136; ++x) { int h=(136-x)*36/32; display.drawLine(x,108-h/2,x,108+h/2,TFT_WHITE); }
+  }
 }
 
 void handleScreenshot() {
@@ -1920,6 +1958,7 @@ void chooseMenuItem() {
         snprintf(command, sizeof(command), "MCU+KEY+%03d", selectedItem + 1);
         if (mcuCommand(command) ||
             request((isCloud() ? "setPlayerCmd:playPreset:" : "MCUKeyShortClick:") + String(selectedItem + 1), body)) {
+        showFeedback(3);
         menuScreen = MenuScreen::Player;
         artworkReady = artworkAttempted = false;
         currentArtworkUrl = "";
@@ -2146,21 +2185,13 @@ void updateDisplaySleep() {
 }
 
 void pollEncoder() {
-  // Four valid quadrature transitions are one physical step (resolution 4).
-  // Gray-code lookup rejects invalid jumps caused by contact bounce.
-  static constexpr int8_t transitions[16] = {
-      0, -1, +1, 0,
-      +1, 0, 0, -1,
-      -1, 0, 0, +1,
-      0, +1, -1, 0};
-  const uint8_t now = (digitalRead(kEncoderA) << 1) | digitalRead(kEncoderB);
-  if (now == encoderPrevious) return;
+  portENTER_CRITICAL(&encoderMux);
+  if (encoderRead == encoderWrite) { portEXIT_CRITICAL(&encoderMux); return; }
+  const int direction = encoderSteps[encoderRead];
+  encoderRead = (encoderRead + 1) & 127;
+  portEXIT_CRITICAL(&encoderMux);
   recordInteraction();
-  encoderAccumulator += transitions[(encoderPrevious << 2) | now];
-  encoderPrevious = now;
-  if (encoderAccumulator >= 4 || encoderAccumulator <= -4) {
-    const int direction = encoderAccumulator > 0 ? 1 : -1;
-    encoderAccumulator = 0;
+  {
     if (menuScreen == MenuScreen::Scan) return;
     if (menuScreen == MenuScreen::EqBandEdit) {
       editingBandValue = constrain(editingBandValue + direction, isCloud() ? -12 : 0, isCloud() ? 12 : 99);
@@ -2231,6 +2262,7 @@ void pollButton() {
         const String tcpCommand = playing ? "MCU+PLY-PUS" : "MCU+PLY-PLA";
         if (mcuCommand(tcpCommand) || request(command, body)) {
           playing = !playing;
+          showFeedback(playing ? 1 : 2);
           deviceOnline = true;
           Serial.println(playing ? "A31 PLAY" : "A31 PAUSE");
         } else {
@@ -2268,7 +2300,7 @@ void pollButton() {
     else if (menuScreen == MenuScreen::EqBands) setMenu(MenuScreen::Settings);
     else if (menuScreen == MenuScreen::ToneList) setMenu(MenuScreen::Settings);
     else setMenu(MenuScreen::Home);
-    encoderAccumulator = 0;
+    portENTER_CRITICAL(&encoderMux); encoderAccumulator = 0; encoderRead = encoderWrite; portEXIT_CRITICAL(&encoderMux);
     marqueeStartedAt = millis();
     marqueeLastAt = marqueeStartedAt;
     marqueeOffset = 0;
@@ -2284,6 +2316,8 @@ void setup() {
   pinMode(kEncoderB, INPUT_PULLUP);
   pinMode(kButton, INPUT_PULLUP);
   encoderPrevious = (digitalRead(kEncoderA) << 1) | digitalRead(kEncoderB);
+  attachInterrupt(digitalPinToInterrupt(kEncoderA), captureEncoder, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(kEncoderB), captureEncoder, CHANGE);
   buttonRawPrevious = buttonStable = digitalRead(kButton);
   display.init();
   display.setBrightness(kNormalBrightness);
@@ -2321,6 +2355,8 @@ void setup() {
     }
   }
   WiFiManager manager;
+  manager.setTitle("airControl KNOB");
+  manager.setCustomHeadElement("<style>body{background:#000!important;color:#fff!important;font-family:Arial,sans-serif}div,form{color:#fff}input,select{background:#161616!important;color:#fff!important;border:1px solid #777!important;border-radius:6px}button,input[type=submit]{background:#fff!important;color:#000!important;border:1px solid #fff!important;border-radius:6px}a{color:#fff!important}.q{color:#bbb!important}</style>");
   manager.setConfigPortalTimeout(180);
   drawWindow("Wi-Fi setup", 60, 207, 12, 1, 0, TFT_WHITE, TFT_BLACK);
   const bool connected = manager.autoConnect("airControl-KNOB-Setup");
@@ -2337,7 +2373,7 @@ void setup() {
     Serial.println("Wi-Fi setup timeout; reboot to try again");
   }
   drawScreen();
-  Serial.println("airControl KNOB v0.8.0: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.1: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
@@ -2352,6 +2388,7 @@ void loop() {
     if (ensureA31Tcp()) pollA31Tcp();
   }
   updateDisplaySleep();
+  if (feedbackKind && static_cast<int32_t>(millis() - feedbackUntil) >= 0) { feedbackKind = 0; if (menuScreen == MenuScreen::Player) drawScreen(); }
   if (webScanRequested) {
     webScanRequested = false;
     discoverZones();
