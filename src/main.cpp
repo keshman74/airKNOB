@@ -40,7 +40,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.3";
+constexpr char kFirmwareVersion[] = "0.8.4";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -345,7 +345,7 @@ uint32_t scanStartedAt = 0;
 uint8_t scanPhase = 0;
 bool scanInBackground = false;
 int scanHost = 1;
-String infoLines[6];
+String infoLines[7];
 int infoLineCount = 0;
 bool muted = false;
 int selectedPreset = 1;
@@ -1140,7 +1140,7 @@ void drawScanScreen() {
   display.setTextColor(TFT_WHITE, TFT_BLACK);
   drawWindow("FIND ZONES", 45, 48, 15, 1, 0, TFT_WHITE, TFT_BLACK);
   display.setTextSize(2);
-  const String progress = scanPhase == 1 ? String("SSDP") : String(scanHost - 1) + "/254";
+  const String progress = scanPhase == 1 ? String("SSDP") : String(scanPhase == 3 ? "R " : "") + String(scanHost - 1) + "/254";
   drawWindow(progress, 40, 96, 8, 2, 0, TFT_WHITE, TFT_BLACK);
   display.setTextSize(1);
   drawWindow(String(zoneCount) + " ZONES FOUND", 40, 149, 16, 1, 0, TFT_WHITE, TFT_BLACK);
@@ -1310,7 +1310,7 @@ async function loadZones(){
   for(const z of d.zones){const o=document.createElement('option');o.value=z.ip;o.textContent=z.name+' · '+z.chip+' · '+z.ip;list.append(o);}
   if(d.zones.some(z=>z.ip===old))list.value=old;else list.value=d.current;
   byId('zone-current').textContent='Выбрана зона: '+d.current;
-  byId('zone-status').textContent=d.scanning?'Идёт поиск… '+d.progress+'/254':'Найдено зон: '+d.zones.length;
+  byId('zone-status').textContent=d.scanning?(d.phase===3?'Повторная проверка A31… ':'Идёт поиск… ')+d.progress+'/254':'Найдено зон: '+d.zones.length;
   byId('zone-search').disabled=d.scanning;
   byId('zone-select').disabled=d.scanning||!list.value;
   clearTimeout(zoneTimer);if(d.scanning)zoneTimer=setTimeout(loadZones,1200);
@@ -1388,7 +1388,7 @@ otaInstall.onclick=async()=>{
  if(!otaManifest||uploadBusy)return;uploadBusy=true;otaInstall.disabled=true;
  try{otaStatus.textContent='Скачиваем версию '+otaManifest.version+'…';const bytes=new Uint8Array(await (await otaFetch(otaManifest.url+'?md5='+otaManifest.md5)).arrayBuffer());
  if(bytes.length!==otaManifest.size||bytes[0]!==0xe9)throw Error('Неверный размер или формат прошивки');
- const form=new FormData();form.append('md5',otaManifest.md5);form.append('firmware',new Blob([bytes]),'firmware.bin');
+ const form=new FormData();form.append('md5',otaManifest.md5);form.append('firmware',new Blob([bytes]),'airControl-KNOB-v'+otaManifest.version+'.bin');
  await uploadFirmware(form,bytes.length);updateSucceeded();
  }catch(e){otaStatus.textContent='Ошибка обновления: '+e.message;otaInstall.disabled=false;uploadBusy=false;}
 };
@@ -1420,6 +1420,7 @@ void startSettingsWeb() {
   settingsServer.on("/zones", HTTP_GET, []() {
     DynamicJsonDocument doc(8192);
     doc["scanning"] = bool(scanPhase || webScanRequested);
+    doc["phase"] = scanPhase;
     doc["current"] = deviceIp;
     doc["progress"] = scanPhase == 1 ? 0 : min(scanHost - 1, 254);
     JsonArray list = doc.createNestedArray("zones");
@@ -1669,6 +1670,24 @@ void pollZoneScan() {
       if (scanInBackground) drawMenu();
       else drawScreen();
     }
+    return;
+  }
+  if (scanPhase == 2 && zoneCount < kMaxZones) {
+    scanPhase = 3; scanHost = 1;
+    Serial.println("Zone search: retry missing port-80 hosts");
+    if (!scanInBackground) drawScreen();
+    return;
+  }
+  if (scanPhase == 3 && scanHost <= 254 && zoneCount < kMaxZones) {
+    const IPAddress ours = WiFi.localIP();
+    const String ipText = IPAddress(ours[0], ours[1], ours[2], scanHost++).toString();
+    bool known = ipText == ours.toString() || !localIp(ipText);
+    for (int i=0; i<zoneCount; ++i) if (zones[i].ip==ipText && zones[i].endpoint.chip!=Chip::Unknown) known=true;
+    if (!known) {
+      WiFiClient probe; IPAddress ip; ip.fromString(ipText);
+      if (probe.connect(ip,80,250)) { probe.stop(); rememberZone(ipText,80); }
+    }
+    if (scanHost%8==0 && !scanInBackground) drawScreen();
     return;
   }
   scanPhase = 0;
@@ -2163,13 +2182,14 @@ void chooseMenuItem() {
       } else if (selectedItem == 5) {
         const uint32_t heapTotal = ESP.getHeapSize();
         const uint32_t heapFree = ESP.getFreeHeap();
-        infoLines[0] = "RAM TOTAL " + String(heapTotal / 1024) + " KB";
-        infoLines[1] = "RAM USED " + String((heapTotal - heapFree) / 1024) + " KB";
-        infoLines[2] = "RAM FREE " + String(heapFree / 1024) + " KB";
-        infoLines[3] = "FIRMWARE " + String(ESP.getSketchSize() / 1024) + " KB";
-        infoLines[4] = "VERSION " + String(kFirmwareVersion);
-        infoLines[5] = "IP: " + WiFi.localIP().toString();
-        infoLineCount = 6;
+        infoLines[0] = "VERSION " + String(kFirmwareVersion);
+        infoLines[1] = "IP:";
+        infoLines[2] = WiFi.localIP().toString();
+        infoLines[3] = "RAM TOTAL " + String(heapTotal / 1024) + " KB";
+        infoLines[4] = "RAM USED " + String((heapTotal - heapFree) / 1024) + " KB";
+        infoLines[5] = "RAM FREE " + String(heapFree / 1024) + " KB";
+        infoLines[6] = "FIRMWARE " + String(ESP.getSketchSize() / 1024) + " KB";
+        infoLineCount = 7;
         setMenu(MenuScreen::MemoryInfo);
         return;
       } else { discoverZones(); return; }
@@ -2459,7 +2479,7 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.3: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.4: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
