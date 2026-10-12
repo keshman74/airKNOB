@@ -47,7 +47,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.7";
+constexpr char kFirmwareVersion[] = "0.8.8";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -404,6 +404,8 @@ bool updateTrackMetadata(const String& title,const String& artist,const String& 
   if(changed) {marqueeOffset=0;marqueeStartedAt=marqueeLastAt=millis();lastArtworkPollAt=millis()-kArtworkPollMs;}
   return changed;
 }
+// Destination-driven sampling fills every output pixel, including when a
+// small source must be enlarged. Decoder callbacks may arrive in MCU blocks.
 int pngLine(PNGDRAW* line) {
   if (!line || sourceWidth < 1 || sourceHeight < 1 || line->iWidth > 2048) return 0;
   static uint16_t pixels[2048];
@@ -411,11 +413,13 @@ int pngLine(PNGDRAW* line) {
   const int side = max(sourceWidth, sourceHeight);
   const int targetW = max(1, sourceWidth * kArtSize / side);
   const int targetH = max(1, sourceHeight * kArtSize / side);
-  const int y = (kArtSize - targetH) / 2 + line->y * targetH / sourceHeight;
-  if (y < 0 || y >= kArtSize) return 1;
-  for (int x = 0; x < targetW; ++x) {
-    const int sourceX = x * line->iWidth / targetW;
-    nextArtPixels[y * kArtSize + (kArtSize - targetW) / 2 + x] = pixels[sourceX];
+  for (int dy=0; dy<targetH; ++dy) {
+    if (dy * sourceHeight / targetH != line->y) continue;
+    for (int dx=0; dx<targetW; ++dx) {
+      const int sx=dx * sourceWidth / targetW;
+      if(sx<line->iWidth)
+        nextArtPixels[((kArtSize-targetH)/2+dy)*kArtSize+(kArtSize-targetW)/2+dx]=pixels[sx];
+    }
   }
   return 1;
 }
@@ -425,15 +429,15 @@ int jpegBlock(JPEGDRAW* block) {
   const int side = max(sourceWidth, sourceHeight);
   const int targetW = max(1, sourceWidth * kArtSize / side);
   const int targetH = max(1, sourceHeight * kArtSize / side);
-  for (int by = 0; by < block->iHeight; ++by) {
-    const int sy = block->y + by;
-    const int dy = (kArtSize - targetH) / 2 + sy * targetH / sourceHeight;
-    if (dy >= kArtSize) continue;
-    for (int bx = 0; bx < block->iWidth; ++bx) {
-      const int sx = block->x + bx;
-      const int dx = (kArtSize - targetW) / 2 + sx * targetW / sourceWidth;
-      if (dx >= 0 && dx < kArtSize)
-        nextArtPixels[dy * kArtSize + dx] = block->pPixels[by * block->iWidth + bx];
+  const int validW=min(block->iWidth,sourceWidth-block->x);
+  for (int dy=0; dy<targetH; ++dy) {
+    const int sy=dy * sourceHeight / targetH;
+    if(sy<block->y || sy>=block->y+block->iHeight) continue;
+    for (int dx=0; dx<targetW; ++dx) {
+      const int sx=dx * sourceWidth / targetW;
+      if(sx<block->x || sx>=block->x+validW) continue;
+      nextArtPixels[((kArtSize-targetH)/2+dy)*kArtSize+(kArtSize-targetW)/2+dx]=
+          block->pPixels[(sy-block->y)*block->iWidth+sx-block->x];
     }
   }
   return 1;
@@ -563,7 +567,7 @@ bool downloadAndDecodeArt(String url) {
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
-    http.addHeader("User-Agent","airControl-KNOB/0.8.7");
+    http.addHeader("User-Agent","airControl-KNOB/0.8.8");
     http.addHeader("Accept","image/*,*/*;q=0.8");
     http.addHeader("Accept-Encoding","identity");
     const int status = http.GET();
@@ -603,6 +607,7 @@ bool downloadAndDecodeArt(String url) {
     }
     http.end();
     bool ok = false;
+    sourceWidth=sourceHeight=0;
     memset(nextArtPixels, 0, sizeof(nextArtPixels));
     const bool complete=declaredSize<=0 || length==size_t(declaredSize);
     if (complete && length > 8 && bytes[0] == 0x89 && bytes[1] == 'P' && bytes[2] == 'N') {
@@ -627,7 +632,7 @@ bool downloadAndDecodeArt(String url) {
     }
     free(bytes);
     if (ok) memcpy(artPixels,nextArtPixels,sizeof(artPixels));
-    Serial.printf("Artwork: %s (%u bytes)\n", ok ? "decoded" : "decode failed", static_cast<unsigned>(length));
+    Serial.printf("Artwork: %s (%u bytes, source %dx%d, target %d)\n", ok ? "decoded" : "decode failed", static_cast<unsigned>(length), sourceWidth, sourceHeight, kArtSize);
     return ok;
   }
   return false;
@@ -2671,7 +2676,7 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.7: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.8: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
