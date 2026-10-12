@@ -12,6 +12,12 @@
 #include <PNGdec.h>
 #include <JPEGDEC.h>
 #include <esp_heap_caps.h>
+#include <atomic>
+#include <lwip/sockets.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <unistd.h>
+#include "discovery_scheduler.h"
 #include "utf8_mono_font.h"
 #include "sans_menu_font.h"
 #include "preset_names.h"
@@ -40,7 +46,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.4";
+constexpr char kFirmwareVersion[] = "0.8.5";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -226,7 +232,7 @@ int editingTone = 0;
 int editingRaw = 0;
 String toneMessage;
 bool mcuCommand(const String& payload, String* reply = nullptr);
-enum class Chip : uint8_t { Unknown, A31, A97, A98, A33 };
+enum class Chip : uint8_t { Unknown, A31, A97, A98, A33, Linkplay };
 struct Endpoint { Chip chip = Chip::Unknown; uint16_t port = 80; bool tls = false; };
 Endpoint activeEndpoint;
 struct ZoneInfo { String ip; String name; String uuid; Endpoint endpoint; };
@@ -249,7 +255,7 @@ int editingBandValue = 0;
 
 const char* chipName(Chip chip) {
   switch (chip) { case Chip::A31: return "A31"; case Chip::A97: return "A97";
-    case Chip::A98: return "A98"; case Chip::A33: return "A33"; default: return "UNKNOWN"; }
+    case Chip::A98: return "A98"; case Chip::A33: return "A33"; case Chip::Linkplay: return "LINKPLAY"; default: return "UNKNOWN"; }
 }
 bool isCloud() { return activeEndpoint.chip == Chip::A33; }
 void applyEndpoint(const Endpoint& endpoint) {
@@ -305,8 +311,12 @@ bool readEndpoint(const String& ip, const Endpoint& endpoint, const String& comm
   }
   return status == 200 && response.length() && response.indexOf("unknown comman") < 0;
 }
+bool looksLikeLinkplayStatus(JsonVariantConst info) {
+  return !info["uuid"].isNull() && (!info["DeviceName"].isNull() || !info["project"].isNull() || !info["hardware"].isNull());
+}
+bool discoveryEpochValid(uint32_t generation);
 bool detectEndpoint(const String& ip, Endpoint& endpoint, String& statusBody,
-                    uint16_t preferredPort = 0) {
+                    uint16_t preferredPort = 0, uint32_t statusTimeoutMs = 1600, uint32_t generation = 0) {
   uint16_t ports[] = {80, 8000, 443, 8443};
   IPAddress address; if (!address.fromString(ip)) return false;
   if (preferredPort) for (int i = 0; i < 4; ++i) if (ports[i] == preferredPort) {
@@ -320,14 +330,16 @@ bool detectEndpoint(const String& ip, Endpoint& endpoint, String& statusBody,
     // GET itself opens the connection. No extra connect/close gate that can
     // reject a responding A31 or leave its HTTP server cleaning up sockets.
     for (int attempt = 0; attempt < (ports[i] == 80 ? 2 : 1); ++attempt) {
+      if (generation && !discoveryEpochValid(generation)) return false;
       String body;
-      if (!readEndpoint(ip, candidate, "getStatusEx", body, ports[i] == 80 ? 1600 : 1200)) {
+      if (!readEndpoint(ip, candidate, "getStatusEx", body, statusTimeoutMs)) {
         if (ports[i] == 80 && attempt == 0) delay(40);
         continue;
       }
       DynamicJsonDocument doc(12288);
       if (deserializeJson(doc, body)) { Serial.printf("Zone %s:%u invalid status JSON\n",ip.c_str(),ports[i]); continue; }
-      const Chip detected = classifyChip(doc.as<JsonVariantConst>());
+      Chip detected = classifyChip(doc.as<JsonVariantConst>());
+      if (detected == Chip::Unknown && !cloudPort && looksLikeLinkplayStatus(doc.as<JsonVariantConst>())) detected = Chip::Linkplay;
       if (detected == Chip::Unknown || (detected == Chip::A33) != cloudPort) {
         Serial.printf("Zone %s:%u unsupported status profile\n",ip.c_str(),ports[i]); break;
       }
@@ -1296,7 +1308,7 @@ void webPage(const String& notice = "") {
   page += "<p>Group: " + htmlEscape(groupValue) + " · master_ip: " + htmlEscape(masterIp) + "</p>";
   if (notice.length()) page += "<section>" + htmlEscape(notice) + "</section>";
   page += F(R"HTML(<section><h2>Зоны</h2><p id="zone-current"></p>
-<button id="zone-search" type="button">Найти зоны</button><p id="zone-status"></p>
+<button id="zone-search" type="button">Найти зоны</button><button id="zone-stop" type="button" hidden>Остановить поиск</button><p id="zone-status"></p>
 <select id="zone-list" style="width:100%;padding:12px;background:#161616;color:white;margin:12px 0"></select>
 <button id="zone-select" type="button" disabled>Выбрать зону</button>
 <p>Поиск A31, A97, A98 и A33. Выбранная зона сохраняется без перезагрузки KNOB.</p></section>
@@ -1313,10 +1325,12 @@ async function loadZones(){
   byId('zone-current').textContent='Выбрана зона: '+d.current;
   byId('zone-status').textContent=d.scanning?(d.phase===3?'Повторная проверка A31… ':'Идёт поиск… ')+d.progress+'/254':'Найдено зон: '+d.zones.length;
   byId('zone-search').disabled=d.scanning;
-  byId('zone-select').disabled=d.scanning||!list.value;
-  clearTimeout(zoneTimer);if(d.scanning)zoneTimer=setTimeout(loadZones,1200);
+  byId('zone-select').disabled=!list.value;
+  byId('zone-stop').hidden=!d.scanning;
+  clearTimeout(zoneTimer);if(d.scanning)zoneTimer=setTimeout(loadZones,500);
  }catch(e){byId('zone-status').textContent=e.message;}
 }
+byId('zone-stop').onclick=async()=>{try{await fetch('/zones/stop',{method:'POST'});await loadZones();}catch(e){byId('zone-status').textContent=e.message;}};
 byId('zone-search').onclick=async()=>{
  try{byId('zone-search').disabled=true;const r=await fetch('/zones/scan',{method:'POST'});if(!r.ok)throw Error('Ошибка поиска');await loadZones();}
  catch(e){byId('zone-status').textContent=e.message;byId('zone-search').disabled=false;}
@@ -1402,6 +1416,7 @@ otaInstall.onclick=async()=>{
 
 bool webScanRequested = false;
 void discoverZones(bool keepMenuVisible = false);
+void cancelZoneScan(bool returnMenu = false);
 
 void drawOtaProgress(const String& state, bool force = false) {
   if (!force && millis()-otaDrawAt < 120) return;
@@ -1441,14 +1456,13 @@ void startSettingsWeb() {
     if (!scanPhase) webScanRequested = true;
     settingsServer.send(202, "text/plain", "Searching");
   });
+  settingsServer.on("/zones/stop", HTTP_POST, []() { cancelZoneScan(true); settingsServer.send(200,"text/plain","Stopped"); });
   settingsServer.on("/zones/select", HTTP_POST, []() {
-    if (scanPhase || webScanRequested) {
-      settingsServer.send(409, "text/plain", "Wait for the search to finish"); return;
-    }
     const String ip = settingsServer.arg("ip");
     int found = -1;
     for (int i = 0; i < zoneCount; ++i) if (zones[i].ip == ip) found = i;
     if (found < 0 || zones[found].endpoint.chip == Chip::Unknown) { settingsServer.send(400, "text/plain", "Zone not found"); return; }
+    cancelZoneScan();
     deviceIp = zones[found].ip;
     applyEndpoint(zones[found].endpoint);
     settings.putString("device", deviceIp);
@@ -1513,6 +1527,7 @@ void startSettingsWeb() {
     []() {
       HTTPUpload& upload = settingsServer.upload();
       if (upload.status == UPLOAD_FILE_START) {
+        cancelZoneScan();
         otaActive = true;
         const long requestedSize = settingsServer.header("X-Firmware-Size").toInt();
         otaExpectedBytes = requestedSize > 0 && requestedSize <= 8*1024*1024 ? size_t(requestedSize) : 0;
@@ -1609,126 +1624,203 @@ String ssdpLocationIp(const String& packet) {
   String host = url.substring(start,hostEnd); IPAddress ip;
   return ip.fromString(host) ? host : String("");
 }
-String ssdpSeen[64];
-int ssdpSeenCount = 0;
-void rememberSsdpCandidate(const String& ip) {
-  if (!localIp(ip)) return;
-  for (int i=0;i<ssdpSeenCount;++i) if (ssdpSeen[i]==ip) return;
-  if (ssdpSeenCount >= 64) return;
-  ssdpSeen[ssdpSeenCount++] = ip;
-  rememberZone(ip);
+struct DiscoveryJob { uint32_t generation; uint8_t host; uint16_t port; };
+struct DiscoveryResult {
+  uint32_t generation; uint8_t host; bool ok; Endpoint endpoint;
+  char name[128]; char uuid[64];
+};
+QueueHandle_t discoveryJobs = nullptr, discoveryResults = nullptr;
+TaskHandle_t discoveryTaskHandle = nullptr;
+std::atomic<uint32_t> discoveryGeneration{0}, discoveryDone{0}, discoveryOwnIp{0};
+std::atomic<bool> discoveryRunning{false};
+std::atomic<int> discoveryProgress{0};
+bool discoveryEpochValid(uint32_t generation) {
+  return discoveryRunning.load() && discoveryGeneration.load()==generation;
 }
-void collectSsdpCandidates(WiFiUDP& udp, int budget) {
-  while (budget-- > 0 && udp.parsePacket() > 0) {
-    const String sender = udp.remoteIP().toString();
-    String packet; packet.reserve(1536);
-    while (udp.available()) { const char c = char(udp.read()); if (packet.length()<1536) packet+=c; }
-    rememberSsdpCandidate(sender);
-    const String location = ssdpLocationIp(packet);
-    if (location.length() && location!=sender) rememberSsdpCandidate(location);
+String discoveryIp(uint8_t host, IPAddress own) { return IPAddress(own[0],own[1],own[2],host).toString(); }
+void discoveryWorker(void*) {
+  struct Probe { int fd=-1; uint8_t host=0; uint16_t port=0; uint32_t started=0; } probes[4];
+  uint32_t generation=0, started=0; int cursor=0;
+  IPAddress own; DiscoveryLedger ledger;
+  const uint16_t ports[4]={80,443,8000,8443};
+  const auto closeProbes=[&]() { for(auto& p:probes) if(p.fd>=0) { ::close(p.fd); p.fd=-1; } };
+  for (;;) {
+    if(!discoveryRunning.load()) { closeProbes(); ulTaskNotifyTake(pdTRUE,portMAX_DELAY); continue; }
+    const uint32_t current=discoveryGeneration.load();
+    if(current!=generation) {
+      closeProbes(); generation=current; started=millis(); cursor=0;
+      own=IPAddress(discoveryOwnIp.load()); ledger=DiscoveryLedger{};
+    }
+    DiscoveryJob job;
+    for(int n=0;n<8 && xQueueReceive(discoveryJobs,&job,0)==pdTRUE;++n)
+      if(job.generation==generation && job.host!=own[3]) ledger.offer(job.host,job.port,millis());
+    // Poll nonblocking connections first. No HTTP client runs while these
+    // probe sockets are open, keeping the ESP32 socket count bounded.
+    int active=0;
+    for(auto& p:probes) if(p.fd>=0) {
+      fd_set writeSet,errorSet; FD_ZERO(&writeSet); FD_ZERO(&errorSet);
+      FD_SET(p.fd,&writeSet); FD_SET(p.fd,&errorSet); timeval timeout={0,0};
+      const int ready=select(p.fd+1,nullptr,&writeSet,&errorSet,&timeout);
+      if(ready>0) {
+        int error=0; socklen_t size=sizeof(error);
+        if(getsockopt(p.fd,SOL_SOCKET,SO_ERROR,&error,&size)==0 && error==0) ledger.offer(p.host,p.port,millis());
+        ::close(p.fd); p.fd=-1;
+      } else if(ready<0 || millis()-p.started>=180) { ::close(p.fd); p.fd=-1; }
+      if(p.fd>=0) ++active;
+    }
+    if(!discoveryEpochValid(generation)) { closeProbes(); continue; }
+    if(active==0) {
+      const int host=ledger.next(millis());
+      if(host>0) {
+        ledger.begin(host);
+        DiscoveryResult result{}; result.generation=generation; result.host=host;
+        String body;
+        result.ok=detectEndpoint(discoveryIp(host,own),result.endpoint,body,ledger.ports[host],600,generation);
+        if(result.ok) {
+          DynamicJsonDocument info(12288);
+          result.ok=!deserializeJson(info,body);
+          if(result.ok) {
+            const String name=result.endpoint.chip==Chip::A33 ? String(info["UserDevName"]|info["DevName"]|"A33") : String(info["DeviceName"]|chipName(result.endpoint.chip));
+            name.toCharArray(result.name,sizeof(result.name));
+            normalizedUuid(String(info["uuid"]|"")).toCharArray(result.uuid,sizeof(result.uuid));
+          }
+        }
+        ledger.finish(host,result.ok,millis());
+        if(discoveryEpochValid(generation)) {
+          // Result queue is bounded; main loop is always free to drain it.
+          while(xQueueSend(discoveryResults,&result,pdMS_TO_TICKS(10))!=pdTRUE && discoveryEpochValid(generation)) {}
+        }
+        vTaskDelay(1); continue;
+      }
+    }
+    // Up to four simultaneous TCP connects, independently of SSDP reception.
+    int launched=0;
+    if(!ledger.hasWork()) for(auto& p:probes) if(p.fd<0) {
+      while(cursor<254*4 && launched<16) {
+        const uint8_t host=cursor/4+1; const uint16_t port=ports[cursor%4];
+        if(host==own[3] || ledger.verified[host] || ledger.attempts[host]>=2) { ++cursor; continue; }
+        const int fd=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+        if(fd<0) break; // retry after outstanding sockets are released
+        if(fcntl(fd,F_SETFL,fcntl(fd,F_GETFL,0)|O_NONBLOCK)<0) { ::close(fd); break; }
+        sockaddr_in address{}; address.sin_family=AF_INET; address.sin_port=htons(port);
+        const String ip=discoveryIp(host,own); address.sin_addr.s_addr=inet_addr(ip.c_str());
+        ++cursor; ++launched;
+        const int connected=::connect(fd,reinterpret_cast<sockaddr*>(&address),sizeof(address));
+        if(connected==0) { ledger.offer(host,port,millis()); ::close(fd); break; }
+        if(errno==EINPROGRESS || errno==EWOULDBLOCK || errno==EALREADY) { p={fd,host,port,millis()}; break; }
+        ::close(fd);
+      }
+    }
+    discoveryProgress.store(min(254,cursor/4));
+    active=0; for(const auto& p:probes) if(p.fd>=0) ++active;
+    if(cursor>=254*4 && !active && !ledger.hasWork() && uxQueueMessagesWaiting(discoveryJobs)==0 && millis()-started>=6500) {
+      discoveryDone.store(generation);
+      while(discoveryEpochValid(generation)) vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    // A finite overall deadline covers hostile/unresponsive endpoints and
+    // socket exhaustion. Preserve all results already verified.
+    if(millis()-started>=60000) { closeProbes(); discoveryDone.store(generation); while(discoveryEpochValid(generation)) vTaskDelay(pdMS_TO_TICKS(5)); }
+    vTaskDelay(pdMS_TO_TICKS(2));
   }
+}
+bool initDiscoveryWorker() {
+  if(discoveryTaskHandle) return true;
+  discoveryJobs=xQueueCreate(32,sizeof(DiscoveryJob));
+  discoveryResults=xQueueCreate(24,sizeof(DiscoveryResult));
+  if(!discoveryJobs || !discoveryResults || xTaskCreatePinnedToCore(discoveryWorker,"zone-search",8192,nullptr,1,&discoveryTaskHandle,0)!=pdPASS) {
+    if(discoveryJobs) vQueueDelete(discoveryJobs); if(discoveryResults) vQueueDelete(discoveryResults);
+    discoveryJobs=discoveryResults=nullptr; discoveryTaskHandle=nullptr; return false;
+  }
+  return true;
+}
+String ssdpSeen[64]; int ssdpSeenCount=0;
+void queueDiscoveryCandidate(const String& ip,uint16_t port=0) {
+  IPAddress address; const IPAddress own=WiFi.localIP();
+  if(!address.fromString(ip) || !localIp(ip) || address[0]!=own[0] || address[1]!=own[1] || address[2]!=own[2] || address==own || !discoveryRunning.load()) return;
+  DiscoveryJob job{discoveryGeneration.load(),address[3],port};
+  xQueueSend(discoveryJobs,&job,0);
+}
+void rememberSsdpCandidate(const String& ip) {
+  if(!localIp(ip)) return;
+  for(int i=0;i<ssdpSeenCount;++i) if(ssdpSeen[i]==ip) return;
+  if(ssdpSeenCount>=64) return;
+  IPAddress address; if(!address.fromString(ip)) return;
+  DiscoveryJob job{discoveryGeneration.load(),address[3],0};
+  if(xQueueSend(discoveryJobs,&job,0)==pdTRUE) ssdpSeen[ssdpSeenCount++]=ip;
+}
+void collectSsdpCandidates(WiFiUDP& udp,int budget) {
+  while(budget-- >0 && udp.parsePacket()>0) {
+    const String sender=udp.remoteIP().toString(); String packet; packet.reserve(1536);
+    while(udp.available()) { const char c=char(udp.read()); if(packet.length()<1536) packet+=c; }
+    rememberSsdpCandidate(sender);
+    const String location=ssdpLocationIp(packet); if(location.length() && location!=sender) rememberSsdpCandidate(location);
+  }
+}
+void sendDiscoveryBurst() {
+  const char* targets[]={"ssdp:all","upnp:rootdevice","urn:schemas-upnp-org:device:MediaRenderer:1"};
+  for(const auto target:targets) {
+    discoveryUdp.beginPacket(IPAddress(239,255,255,250),1900);
+    discoveryUdp.print(String("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: ")+target+"\r\n\r\n");
+    discoveryUdp.endPacket();
+  }
+}
+uint8_t discoveryBursts=0; uint32_t discoveryUiAt=0;
+void cancelZoneScan(bool returnMenu) {
+  const bool wasRunning=scanPhase!=0;
+  if(wasRunning && zoneCount) {
+    String cache; for(int i=0;i<zoneCount;++i) { if(i) cache+=';'; cache+=zones[i].ip; }
+    settings.putString("zone-cache",cache);
+  }
+  discoveryRunning.store(false); discoveryGeneration.fetch_add(1);
+  discoveryUdp.stop(); cloudDiscoveryUdp.stop(); ssdpNotifyUdp.stop(); scanPhase=0; webScanRequested=false;
+  if(returnMenu && wasRunning && menuScreen==MenuScreen::Scan) setMenu(scanReturnScreen);
 }
 void discoverZones(bool keepMenuVisible) {
-  if (scanPhase == 1) discoveryUdp.stop();
-  ssdpNotifyUdp.stop();
-  if (WiFi.status() != WL_CONNECTED) {
-    menuMessage = "WI-FI OFF";
-    drawScreen();
-    return;
-  }
-  scanReturnScreen = menuScreen == MenuScreen::Multiroom ? MenuScreen::Multiroom :
-                     menuScreen == MenuScreen::Join ? MenuScreen::Join : MenuScreen::Zone;
-  const String current = deviceIp;
-  zoneCount = 0;
-  rememberZone(current);
-
-  scanInBackground = keepMenuVisible;
-  if (!keepMenuVisible) { menuScreen = MenuScreen::Scan; selectedItem = 0; }
-  menuMessage = "SEARCHING";
-  scanHost = 1; scanPortIndex = 0;
-  for (int i=0;i<ssdpSeenCount;++i) ssdpSeen[i]=""; ssdpSeenCount=0;
-  cloudDiscoveryUdp.begin(53308);
-  ssdpNotifyUdp.beginMulticast(IPAddress(239,255,255,250),1900);
-  scanStartedAt = millis();
-  scanPhase = 1;
-  if (discoveryUdp.begin(0)) {
-    discoveryUdp.beginPacket(IPAddress(239, 255, 255, 250), 1900);
-    discoveryUdp.print("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
-                       "MAN: \"ssdp:discover\"\r\nMX: 1\r\nST: ssdp:all\r\n\r\n");
-    discoveryUdp.endPacket();
-    discoveryUdp.beginPacket(IPAddress(239, 255, 255, 250), 1900);
-    discoveryUdp.print("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n");
-    discoveryUdp.endPacket();
-  } else {
-    scanPhase = 2;
-  }
-  drawScreen();
+  cancelZoneScan();
+  if(WiFi.status()!=WL_CONNECTED || !initDiscoveryWorker()) { menuMessage="SEARCH UNAVAILABLE"; drawScreen(); return; }
+  scanReturnScreen=menuScreen==MenuScreen::Join ? MenuScreen::Join : MenuScreen::Zone;
+  xQueueReset(discoveryJobs); xQueueReset(discoveryResults);
+  discoveryOwnIp.store(uint32_t(WiFi.localIP())); discoveryProgress.store(0); discoveryDone.store(0);
+  for(int i=0;i<ssdpSeenCount;++i) ssdpSeen[i]=""; ssdpSeenCount=0;
+  discoveryGeneration.fetch_add(1); discoveryRunning.store(true);
+  queueDiscoveryCandidate(deviceIp,activeEndpoint.port);
+  for(int i=0;i<zoneCount;++i) queueDiscoveryCandidate(zones[i].ip,zones[i].endpoint.port);
+  String cached=settings.getString("zone-cache","");
+  while(cached.length()) { const int end=cached.indexOf(';'); const String ip=cached.substring(0,end<0?cached.length():end); queueDiscoveryCandidate(ip); if(end<0) break; cached.remove(0,end+1); }
+  zoneCount=0; scanHost=1; scanPhase=2; scanInBackground=keepMenuVisible;
+  if(!keepMenuVisible) { menuScreen=scanReturnScreen; selectedItem=0; }
+  cloudDiscoveryUdp.begin(53308); ssdpNotifyUdp.beginMulticast(IPAddress(239,255,255,250),1900);
+  discoveryUdp.begin(0); scanStartedAt=millis(); discoveryBursts=1; discoveryUiAt=0;
+  xTaskNotifyGive(discoveryTaskHandle);
+  sendDiscoveryBurst(); menuMessage="SEARCHING"; drawScreen();
 }
-
 void pollZoneScan() {
-  if (!scanPhase) return;
-  collectSsdpCandidates(ssdpNotifyUdp, 2);
-  for (int i = 0; i < 2; ++i) {
-    const int length = cloudDiscoveryUdp.parsePacket(); if (length <= 0) break;
-    const String ip = cloudDiscoveryUdp.remoteIP().toString();
-    while (cloudDiscoveryUdp.available()) cloudDiscoveryUdp.read();
-    rememberZone(ip);
+  if(!scanPhase) return;
+  // Always drain discovery traffic before anything that can draw a menu.
+  collectSsdpCandidates(discoveryUdp,12); collectSsdpCandidates(ssdpNotifyUdp,8);
+  for(int i=0;i<4 && cloudDiscoveryUdp.parsePacket()>0;++i) {
+    const String ip=cloudDiscoveryUdp.remoteIP().toString(); while(cloudDiscoveryUdp.available()) cloudDiscoveryUdp.read(); rememberSsdpCandidate(ip);
   }
-  if (menuScreen != MenuScreen::Scan &&
-      !scanInBackground) {
-    discoveryUdp.stop(); cloudDiscoveryUdp.stop(); ssdpNotifyUdp.stop();
-    scanPhase = 0;
-    return;
+  if(discoveryBursts<3 && millis()-scanStartedAt>=uint32_t(discoveryBursts)*800) { sendDiscoveryBurst(); ++discoveryBursts; }
+  DiscoveryResult result; bool changed=false;
+  while(xQueueReceive(discoveryResults,&result,0)==pdTRUE) {
+    if(result.generation!=discoveryGeneration.load() || !result.ok) continue;
+    const String ip=discoveryIp(result.host,WiFi.localIP()); int index=-1;
+    for(int i=0;i<zoneCount;++i) if(zones[i].ip==ip) index=i;
+    if(index<0) { if(zoneCount>=kMaxZones) continue; index=zoneCount++; }
+    zones[index]=ZoneInfo{ip,String(result.name),String(result.uuid),result.endpoint}; changed=true;
+    if(ip==deviceIp && (activeEndpoint.chip!=result.endpoint.chip || activeEndpoint.port!=result.endpoint.port || activeEndpoint.tls!=result.endpoint.tls)) applyEndpoint(result.endpoint);
+    Serial.printf("Zone verified: %s %s %s:%u\n",result.name,chipName(result.endpoint.chip),ip.c_str(),result.endpoint.port);
   }
-  if (scanPhase == 1) {
-    collectSsdpCandidates(discoveryUdp, 5);
-    if (millis() - scanStartedAt < 1400) return;
-    discoveryUdp.stop();
-    scanPhase = 2;
+  scanHost=discoveryProgress.load()+1;
+  if(changed || millis()-discoveryUiAt>=500) {
+    discoveryUiAt=millis(); menuMessage=String(zoneCount)+" FOUND | SEARCH";
+    if(menuScreen==MenuScreen::Zone || menuScreen==MenuScreen::Join) { selectedItem=constrain(selectedItem,0,max(0,menuCount()-1)); drawMenu(); }
   }
-  if (scanPhase == 2 && scanHost <= 254 && zoneCount < kMaxZones) {
-    const IPAddress ours = WiFi.localIP();
-    const String ipText = IPAddress(ours[0], ours[1], ours[2], scanHost).toString();
-    const uint16_t ports[] = {80, 443, 8000, 8443};
-    bool known = ipText == ours.toString() || !localIp(ipText);
-    for (int i = 0; i < zoneCount; ++i) if (zones[i].ip == ipText && zones[i].endpoint.chip != Chip::Unknown) known = true;
-    if (!known) {
-      WiFiClient probe; IPAddress ip; ip.fromString(ipText);
-      if (probe.connect(ip, ports[scanPortIndex], ports[scanPortIndex] == 80 ? 110 : 90)) { probe.stop(); rememberZone(ipText, ports[scanPortIndex]); }
-    }
-    if (known || ++scanPortIndex >= 4) { scanPortIndex = 0; ++scanHost; }
-    if (scanHost % 8 == 0) {
-      if (scanInBackground) menuMessage = String(scanHost - 1) + "/254";
-      if (scanInBackground) drawMenu();
-      else drawScreen();
-    }
-    return;
+  if(discoveryDone.load()==discoveryGeneration.load() || zoneCount>=kMaxZones || WiFi.status()!=WL_CONNECTED) {
+    cancelZoneScan(); menuMessage=String(zoneCount)+" ZONES FOUND";
+    if(menuScreen==MenuScreen::Zone || menuScreen==MenuScreen::Join) drawMenu();
   }
-  if (scanPhase == 2 && zoneCount < kMaxZones) {
-    scanPhase = 3; scanHost = 1;
-    Serial.println("Zone search: retry missing port-80 hosts");
-    if (!scanInBackground) drawScreen();
-    return;
-  }
-  if (scanPhase == 3 && scanHost <= 254 && zoneCount < kMaxZones) {
-    const IPAddress ours = WiFi.localIP();
-    const String ipText = IPAddress(ours[0], ours[1], ours[2], scanHost++).toString();
-    bool known = ipText == ours.toString() || !localIp(ipText);
-    for (int i=0; i<zoneCount; ++i) if (zones[i].ip==ipText && zones[i].endpoint.chip!=Chip::Unknown) known=true;
-    if (!known) {
-      WiFiClient probe; IPAddress ip; ip.fromString(ipText);
-      if (probe.connect(ip,80,250)) { probe.stop(); rememberZone(ipText,80); }
-    }
-    if (scanHost%8==0 && !scanInBackground) drawScreen();
-    return;
-  }
-  scanPhase = 0;
-  cloudDiscoveryUdp.stop(); ssdpNotifyUdp.stop();
-  if (!scanInBackground) menuScreen = scanReturnScreen;
-  selectedItem = 0;
-  menuMessage = String(zoneCount) + " ZONES FOUND";
-  if (scanInBackground) drawMenu();
-  else drawScreen();
 }
 
 bool openInformation(MenuScreen screen) {
@@ -2123,6 +2215,7 @@ void chooseMenuItem() {
       break;
     case MenuScreen::Join: {
       const int target = joinZoneIndex(selectedItem);
+      if (target >= 0) cancelZoneScan();
       if (target < 0) { discoverZones(); break; }
       if (zones[target].endpoint.chip == Chip::Unknown) { menuMessage = "FIND ZONES FIRST"; break; }
       if ((zones[target].endpoint.chip == Chip::A33) != isCloud()) { menuMessage = "DIFFERENT FAMILY"; break; }
@@ -2168,6 +2261,7 @@ void chooseMenuItem() {
     }
     case MenuScreen::Zone:
       if (selectedItem >= zoneCount) { discoverZones(); break; }
+      cancelZoneScan();
       deviceIp = zones[selectedItem].ip;
       applyEndpoint(zones[selectedItem].endpoint);
       settings.putString("device", deviceIp);
@@ -2385,8 +2479,7 @@ void pollButton() {
     } else if (!longPressHandled) {
       String body;
       if (menuScreen == MenuScreen::Scan) {
-        discoveryUdp.stop();
-        scanPhase = 0; cloudDiscoveryUdp.stop(); ssdpNotifyUdp.stop();
+        cancelZoneScan();
         setMenu(scanReturnScreen);
       } else if (menuScreen == MenuScreen::DeviceInfo || menuScreen == MenuScreen::NetworkInfo ||
                  menuScreen == MenuScreen::MemoryInfo) {
@@ -2415,9 +2508,9 @@ void pollButton() {
   if (raw == LOW && buttonStable == LOW && !longPressHandled &&
       millis() - pressedAt >= kLongPressMs) {
     longPressHandled = true;
+    if (scanPhase) cancelZoneScan();
     if (menuScreen == MenuScreen::Scan) {
-      discoveryUdp.stop();
-      scanPhase = 0; cloudDiscoveryUdp.stop(); ssdpNotifyUdp.stop();
+      cancelZoneScan();
       setMenu(scanReturnScreen);
     } else if (menuScreen == MenuScreen::DeviceInfo || menuScreen == MenuScreen::NetworkInfo ||
                menuScreen == MenuScreen::MemoryInfo)
@@ -2511,7 +2604,7 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.4: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.5: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
@@ -2520,21 +2613,22 @@ void loop() {
   if (WiFi.status() == WL_CONNECTED) settingsServer.handleClient();
   if (rebootAfterResponse) { delay(500); ESP.restart(); }
   if (otaActive) { delay(1); return; }
-  if (WiFi.status() == WL_CONNECTED) handleScreenshot();
+  if (WiFi.status() == WL_CONNECTED && !scanPhase) handleScreenshot();
   pollEncoder();
   pollButton();
   if (WiFi.status() == WL_CONNECTED) {
-    if (ensureA31Tcp()) pollA31Tcp();
+    if (!scanPhase && ensureA31Tcp()) pollA31Tcp();
   }
   updateDisplaySleep();
   if (feedbackKind && static_cast<int32_t>(millis() - feedbackUntil) >= 0) { feedbackKind = 0; if (menuScreen == MenuScreen::Player) drawScreen(); }
   if (webScanRequested) {
     webScanRequested = false;
-    discoverZones();
+    discoverZones(true);
   }
   if (scanPhase) {
     pollZoneScan();
-    if (menuScreen == MenuScreen::Scan) { delay(1); return; }
+    sendVolumeWhenReady();
+    delay(1); return;
   }
   if (millis() - marqueeStartedAt >= 1400 &&
       millis() - marqueeLastAt >= kMarqueeStepMs) {

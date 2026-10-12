@@ -1,6 +1,6 @@
 from pathlib import Path
 import subprocess
-s=Path('src/main.cpp').read_text();a=s.index('String ssdpLocationIp(');b=s.index('String ssdpSeen[',a)
+s=Path('src/main.cpp').read_text();a=s.index('String ssdpLocationIp(');b=s.index('struct DiscoveryJob',a)
 code=r'''
 #include <string>
 #include <algorithm>

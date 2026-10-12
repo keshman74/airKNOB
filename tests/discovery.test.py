@@ -9,13 +9,15 @@ code=r'''
 #include <cassert>
 #include <cstdint>
 using String=std::string;
-enum class Chip {Unknown,A31,A97,A98,A33};
+enum class Chip {Unknown,A31,A97,A98,A33,Linkplay};
 struct Endpoint{Chip chip=Chip::Unknown;uint16_t port=80;bool tls=false;};
 struct IPAddress{bool fromString(const String&s){return s=="192.168.0.2";}};
 using JsonVariantConst=Chip;
 struct DynamicJsonDocument{Chip chip;DynamicJsonDocument(int){} template<class T>T as(){return chip;}};
-bool deserializeJson(DynamicJsonDocument&d,const String&s){if(s=="A31")d.chip=Chip::A31;else if(s=="A97")d.chip=Chip::A97;else if(s=="A98")d.chip=Chip::A98;else if(s=="A33")d.chip=Chip::A33;else return true;return false;}
+bool deserializeJson(DynamicJsonDocument&d,const String&s){if(s=="A31")d.chip=Chip::A31;else if(s=="A97")d.chip=Chip::A97;else if(s=="A98")d.chip=Chip::A98;else if(s=="A33")d.chip=Chip::A33;else if(s=="GENERIC")d.chip=Chip::Unknown;else return true;return false;}
 Chip classifyChip(Chip c){return c;}
+bool epochValid=true; bool discoveryEpochValid(uint32_t){return epochValid;}
+bool looksLikeLinkplayStatus(Chip c){return c==Chip::Unknown;}
 struct Logger{template<class...T>void printf(const char*,T...) {}} Serial;
 void delay(int){}
 std::vector<Endpoint> calls; uint16_t availablePort; String reply; bool failFirst=false;
@@ -35,6 +37,8 @@ int main(){
  calls.clear();availablePort=80;reply="A31";failFirst=true;
  assert(detectEndpoint("192.168.0.2",result,body));assert(calls.size()==2);assert(result.chip==Chip::A31);failFirst=false;
  calls.clear();availablePort=8000;reply="A31";assert(!detectEndpoint("192.168.0.2",result,body,8000));
+ calls.clear();availablePort=80;reply="GENERIC";assert(detectEndpoint("192.168.0.2",result,body));assert(result.chip==Chip::Linkplay);
+ calls.clear();epochValid=false;assert(!detectEndpoint("192.168.0.2",result,body,80,600,1));assert(calls.empty());epochValid=true;
  calls.clear();availablePort=80;reply="invalid JSON";assert(!detectEndpoint("192.168.0.2",result,body));
 }
 '''
