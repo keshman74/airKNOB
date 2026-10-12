@@ -12,6 +12,7 @@
 #include <PNGdec.h>
 #include "artwork_thumbnail.h"
 #include "preset_resume.h"
+#include "preset_selection.h"
 #include <JPEGDEC.h>
 #include <esp_heap_caps.h>
 #include <atomic>
@@ -49,7 +50,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.12";
+constexpr char kFirmwareVersion[] = "0.8.13";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -200,7 +201,7 @@ void IRAM_ATTR captureEncoder() {
   portEXIT_CRITICAL_ISR(&encoderMux);
 }
 uint32_t feedbackUntil = 0;
-int feedbackKind = 0; // 1 play, 2 pause, 3 preset selected
+int feedbackKind = 0; // 1 play, 2 pause, 3 preset selected, 4 checking selection
 void showFeedback(int kind) { feedbackKind = kind; feedbackUntil = millis() + 2000; }
 
 bool buttonRawPrevious = HIGH;
@@ -293,7 +294,8 @@ String encodeCommand(const String& value) {
   return out;
 }
 bool readEndpoint(const String& ip, const Endpoint& endpoint, const String& command,
-                  String& response, uint32_t timeoutMs = 1200) {
+                  String& response, uint32_t timeoutMs = 1200, int* responseStatus = nullptr) {
+  if(responseStatus) *responseStatus=0;
   IPAddress address;
   if (WiFi.status() != WL_CONNECTED || !address.fromString(ip)) return false;
   WiFiClient plain;
@@ -306,6 +308,7 @@ bool readEndpoint(const String& ip, const Endpoint& endpoint, const String& comm
   const String url = String(endpoint.tls ? "https://" : "http://") + ip + ":" + String(endpoint.port) + path + encodeCommand(command);
   if (!(endpoint.tls ? http.begin(secure, url) : http.begin(plain, url))) return false;
   const int status = http.GET();
+  if(responseStatus) *responseStatus=status;
   response = status == 200 ? http.getString() : "";
   http.end();
   if (endpoint.chip == Chip::A33) {
@@ -640,7 +643,7 @@ bool downloadAndDecodeArtOriginal(String url) {
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
-    http.addHeader("User-Agent","airControl-KNOB/0.8.12");
+    http.addHeader("User-Agent","airControl-KNOB/0.8.13");
     http.addHeader("Accept","image/*,*/*;q=0.8");
     http.addHeader("Accept-Encoding","identity");
     const int status = http.GET();
@@ -1403,7 +1406,7 @@ void drawScreen() {
   if(!feedbackActive || slaveLabel) drawWindow(deviceOnline ? (slaveLabel ? "SLAVE MODE" : (playing?"PLAY":"PAUSE")) : "OFFLINE",
     60,32,12,1,0,slaveLabel?display.color565(255,60,60):TFT_WHITE,TFT_BLACK);
   if(feedbackActive) {
-    if(feedbackKind==3) drawWindow("SELECTED",60,32,12,1,0,accentColor(),TFT_BLACK);
+    if(feedbackKind==3 || feedbackKind==4) drawWindow(feedbackKind==4 ? "CHECKING" : "SELECTED",60,32,12,1,0,accentColor(),TFT_BLACK);
     else {
       const int x=slaveLabel?54:111,y=31;
       if(feedbackKind==2) {display.fillRect(x,y,5,18,TFT_WHITE);display.fillRect(x+11,y,5,18,TFT_WHITE);}
@@ -2376,16 +2379,24 @@ void chooseMenuItem() {
         if (isSlave) { menuMessage = "SLAVE: NO PRESET"; break; }
         char command[16];
         snprintf(command, sizeof(command), "MCU+KEY+%03d", slot);
-        const bool sent=isCloud() ? request("choicePreset:"+String(slot),body) :
-            (mcuCommand(command) || request("MCUKeyShortClick:"+String(slot),body));
+        bool sent=false;bool unconfirmed=false;
+        if(isCloud()) {
+          int status=0;
+          readEndpoint(deviceIp,activeEndpoint,"choicePreset:"+String(slot),body,1200,&status);
+          const auto result=classifyA33PresetSelection(status,std::string(body.c_str()));
+          sent=result!=PresetSelection::Rejected;
+          unconfirmed=result==PresetSelection::Unconfirmed;
+          Serial.printf("A33 preset %d HTTP=%d bytes=%u result=%s\n",slot,status,unsigned(body.length()),
+              unconfirmed?"unconfirmed":sent?"accepted":"rejected");
+        } else sent=mcuCommand(command) || request("MCUKeyShortClick:"+String(slot),body);
         if (sent) {
-        if(isCloud()) {presetResumeZone=deviceIp;presetResume.schedule(millis());}
+        if(isCloud() && !unconfirmed) {presetResumeZone=deviceIp;presetResume.schedule(millis());}
         menuScreen = MenuScreen::Player;
         artworkReady = artworkAttempted = false;
         currentArtworkUrl = "";
         // Let A31 change tracks before fetching its artwork; volume stays live.
         lastArtworkPollAt = millis() - kArtworkPollMs + 2500;
-        showFeedback(3);
+        showFeedback(unconfirmed ? 4 : 3);
         lastPollAt = millis() - kFallbackPollIntervalMs;
         drawScreen();
         return;
@@ -2810,7 +2821,7 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.12: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.13: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
