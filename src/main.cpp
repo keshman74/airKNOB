@@ -47,7 +47,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.8";
+constexpr char kFirmwareVersion[] = "0.8.9";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -567,7 +567,7 @@ bool downloadAndDecodeArt(String url) {
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
-    http.addHeader("User-Agent","airControl-KNOB/0.8.8");
+    http.addHeader("User-Agent","airControl-KNOB/0.8.9");
     http.addHeader("Accept","image/*,*/*;q=0.8");
     http.addHeader("Accept-Encoding","identity");
     const int status = http.GET();
@@ -623,9 +623,15 @@ bool downloadAndDecodeArt(String url) {
       if (jpegDecoder.openRAM(bytes, length, jpegBlock)) {
         sourceWidth = jpegDecoder.getWidth();
         sourceHeight = jpegDecoder.getHeight();
+        const bool validDimensions=sourceWidth>0 && sourceHeight>0 && sourceWidth<=2048 && sourceHeight<=2048;
+        // JPEGDEC emits progressive DC thumbnails at ceil(original / 8).
+        // Callback coordinates refer to that output, not the JPEG header size.
+        if (jpegDecoder.getJPEGType() == JPEG_MODE_PROGRESSIVE) {
+          sourceWidth=(sourceWidth+7)/8;
+          sourceHeight=(sourceHeight+7)/8;
+        }
         jpegDecoder.setPixelType(RGB565_LITTLE_ENDIAN);
-        ok = sourceWidth > 0 && sourceHeight > 0 &&
-             sourceWidth <= 2048 && sourceHeight <= 2048 &&
+        ok = validDimensions &&
              jpegDecoder.decode(0, 0, 0) == 1;
         jpegDecoder.close();
       }
@@ -2676,7 +2682,7 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.8: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.9: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }

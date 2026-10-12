@@ -1,6 +1,9 @@
 from pathlib import Path
 import subprocess
 s=Path('src/main.cpp').read_text();callbacks=s[s.index('int pngLine('):s.index('\nString decodeXml')]
+assert 'jpegDecoder.getJPEGType() == JPEG_MODE_PROGRESSIVE' in s
+assert 'sourceWidth=(sourceWidth+7)/8;' in s
+assert 'sourceHeight=(sourceHeight+7)/8;' in s
 code=r'''
 #include <algorithm>
 #include <cassert>
@@ -17,7 +20,7 @@ struct JPEGDRAW{int x,y,iWidth,iHeight;uint16_t*pPixels;};
 void verify(){int side=max(sourceWidth,sourceHeight),w=max(1,sourceWidth*76/side),h=max(1,sourceHeight*76/side);
 for(int y=0;y<76;++y)for(int x=0;x<76;++x){int dx=x-(76-w)/2,dy=y-(76-h)/2;
 uint16_t expected=dx>=0&&dx<w&&dy>=0&&dy<h?value(dx*sourceWidth/w,dy*sourceHeight/h):0;assert(nextArtPixels[y*76+x]==expected);}}
-int main(){for(auto size:std::vector<std::pair<int,int>>{{1,1},{8,8},{16,16},{32,24},{24,32},{76,76},{77,79},{600,600},{1024,512},{2048,2048}}){
+int main(){for(auto size:std::vector<std::pair<int,int>>{{1,1},{8,8},{16,16},{32,24},{24,32},{75,75},{76,76},{77,79},{600,600},{1024,512},{2048,2048}}){
 sourceWidth=size.first;sourceHeight=size.second;memset(nextArtPixels,0,sizeof(nextArtPixels));
 for(int y=0;y<sourceHeight;++y){PNGDRAW p{sourceWidth,y};assert(pngLine(&p)==1);}verify();memset(nextArtPixels,0,sizeof(nextArtPixels));
 for(int y=0;y<sourceHeight;y+=16)for(int x=0;x<sourceWidth;x+=16){int h=min(16,sourceHeight-y);uint16_t pixels[256];
