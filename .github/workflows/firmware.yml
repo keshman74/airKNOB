@@ -20,6 +20,7 @@ jobs:
       - run: pip install platformio==6.1.18
       - run: node tests/web-zones.test.cjs
       - run: python3 tests/encoder.test.py
+      - run: python3 tests/discovery.test.py
       - run: node tests/upload.test.cjs
       - run: pio run
       - run: python3 scripts/publish_manifest.py

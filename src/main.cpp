@@ -40,7 +40,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.2";
+constexpr char kFirmwareVersion[] = "0.8.3";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -305,22 +305,35 @@ bool readEndpoint(const String& ip, const Endpoint& endpoint, const String& comm
   }
   return status == 200 && response.length() && response.indexOf("unknown comman") < 0;
 }
-bool detectEndpoint(const String& ip, Endpoint& endpoint, String& statusBody) {
-  const uint16_t ports[] = {80, 8000, 443, 8443};
+bool detectEndpoint(const String& ip, Endpoint& endpoint, String& statusBody,
+                    uint16_t preferredPort = 0) {
+  uint16_t ports[] = {80, 8000, 443, 8443};
   IPAddress address; if (!address.fromString(ip)) return false;
+  if (preferredPort) for (int i = 0; i < 4; ++i) if (ports[i] == preferredPort) {
+    const uint16_t first = ports[0]; ports[0] = ports[i]; ports[i] = first; break;
+  }
   for (int i = 0; i < 4; ++i) {
-    WiFiClient probe;
-    if (!probe.connect(address, ports[i], 90)) continue;
-    probe.stop();
-    Endpoint candidate; candidate.port = ports[i]; candidate.tls = i >= 2;
-    candidate.chip = (i == 1 || i == 3) ? Chip::A33 : Chip::Unknown;
-    String body; if (!readEndpoint(ip, candidate, "getStatusEx", body, 900)) continue;
-    DynamicJsonDocument doc(12288);
-    if (deserializeJson(doc, body)) continue;
-    candidate.chip = classifyChip(doc.as<JsonVariantConst>());
-    if (candidate.chip == Chip::Unknown) continue;
-    if ((candidate.chip == Chip::A33) != (i == 1 || i == 3)) continue;
-    endpoint = candidate; statusBody = body; return true;
+    Endpoint candidate; candidate.port = ports[i];
+    candidate.tls = ports[i] == 443 || ports[i] == 8443;
+    const bool cloudPort = ports[i] == 8000 || ports[i] == 8443;
+    candidate.chip = cloudPort ? Chip::A33 : Chip::Unknown;
+    // GET itself opens the connection. No extra connect/close gate that can
+    // reject a responding A31 or leave its HTTP server cleaning up sockets.
+    for (int attempt = 0; attempt < (ports[i] == 80 ? 2 : 1); ++attempt) {
+      String body;
+      if (!readEndpoint(ip, candidate, "getStatusEx", body, ports[i] == 80 ? 1600 : 1200)) {
+        if (ports[i] == 80 && attempt == 0) delay(40);
+        continue;
+      }
+      DynamicJsonDocument doc(12288);
+      if (deserializeJson(doc, body)) { Serial.printf("Zone %s:%u invalid status JSON\n",ip.c_str(),ports[i]); continue; }
+      const Chip detected = classifyChip(doc.as<JsonVariantConst>());
+      if (detected == Chip::Unknown || (detected == Chip::A33) != cloudPort) {
+        Serial.printf("Zone %s:%u unsupported status profile\n",ip.c_str(),ports[i]); break;
+      }
+      candidate.chip = detected;
+      endpoint = candidate; statusBody = body; return true;
+    }
   }
   return false;
 }
@@ -1563,11 +1576,11 @@ bool localIp(const String& ipText) {
   return true;
 }
 
-void rememberZone(const String& ip) {
+void rememberZone(const String& ip, uint16_t preferredPort = 0) {
   if (zoneCount >= kMaxZones || !localIp(ip)) return;
   for (int i = 0; i < zoneCount; ++i) if (zones[i].ip == ip && zones[i].endpoint.chip != Chip::Unknown) return;
   Endpoint endpoint; String body;
-  if (!detectEndpoint(ip, endpoint, body)) return;
+  if (!detectEndpoint(ip, endpoint, body, preferredPort)) { Serial.printf("Zone %s not identified\n",ip.c_str()); return; }
   DynamicJsonDocument info(12288); if (deserializeJson(info, body)) return;
   int index = -1;
   for (int i = 0; i < zoneCount; ++i) if (zones[i].ip == ip) index = i;
@@ -1605,6 +1618,9 @@ void discoverZones(bool keepMenuVisible) {
     discoveryUdp.print("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
                        "MAN: \"ssdp:discover\"\r\nMX: 1\r\nST: ssdp:all\r\n\r\n");
     discoveryUdp.endPacket();
+    discoveryUdp.beginPacket(IPAddress(239, 255, 255, 250), 1900);
+    discoveryUdp.print("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n");
+    discoveryUdp.endPacket();
   } else {
     scanPhase = 2;
   }
@@ -1620,7 +1636,7 @@ void pollZoneScan() {
     rememberZone(ip);
   }
   if (menuScreen != MenuScreen::Scan &&
-      !(scanInBackground && menuScreen == MenuScreen::Zone)) {
+      !scanInBackground) {
     discoveryUdp.stop(); cloudDiscoveryUdp.stop();
     scanPhase = 0;
     return;
@@ -1645,7 +1661,7 @@ void pollZoneScan() {
     for (int i = 0; i < zoneCount; ++i) if (zones[i].ip == ipText && zones[i].endpoint.chip != Chip::Unknown) known = true;
     if (!known) {
       WiFiClient probe; IPAddress ip; ip.fromString(ipText);
-      if (probe.connect(ip, ports[scanPortIndex], 70)) { probe.stop(); rememberZone(ipText); }
+      if (probe.connect(ip, ports[scanPortIndex], ports[scanPortIndex] == 80 ? 110 : 90)) { probe.stop(); rememberZone(ipText, ports[scanPortIndex]); }
     }
     if (known || ++scanPortIndex >= 4) { scanPortIndex = 0; ++scanHost; }
     if (scanHost % 8 == 0) {
@@ -2443,7 +2459,7 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.2: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.3: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
