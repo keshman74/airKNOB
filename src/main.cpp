@@ -340,6 +340,7 @@ bool detectEndpoint(const String& ip, Endpoint& endpoint, String& statusBody,
 
 int zoneCount = 0;
 WiFiUDP discoveryUdp;
+WiFiUDP ssdpNotifyUdp;
 MenuScreen scanReturnScreen = MenuScreen::Zone;
 uint32_t scanStartedAt = 0;
 uint8_t scanPhase = 0;
@@ -1594,8 +1595,42 @@ void rememberZone(const String& ip, uint16_t preferredPort = 0) {
   Serial.printf("Zone: %s %s %s:%u\n", zone.name.c_str(), chipName(endpoint.chip), ip.c_str(), endpoint.port);
 }
 
+String ssdpLocationIp(const String& packet) {
+  String lower = packet; lower.toLowerCase();
+  int at = lower.indexOf("\nlocation:");
+  if (at < 0) return "";
+  at += 10;
+  int end = packet.indexOf('\n',at);
+  String url = packet.substring(at,end < 0 ? packet.length() : end); url.trim();
+  if (!url.startsWith("http://") && !url.startsWith("https://")) return "";
+  const int start = url.indexOf("://") + 3;
+  int hostEnd = url.length();
+  for (int i=start;i<int(url.length());++i) if (url[i]==':' || url[i]=='/') { hostEnd=i; break; }
+  String host = url.substring(start,hostEnd); IPAddress ip;
+  return ip.fromString(host) ? host : String("");
+}
+String ssdpSeen[64];
+int ssdpSeenCount = 0;
+void rememberSsdpCandidate(const String& ip) {
+  if (!localIp(ip)) return;
+  for (int i=0;i<ssdpSeenCount;++i) if (ssdpSeen[i]==ip) return;
+  if (ssdpSeenCount >= 64) return;
+  ssdpSeen[ssdpSeenCount++] = ip;
+  rememberZone(ip);
+}
+void collectSsdpCandidates(WiFiUDP& udp, int budget) {
+  while (budget-- > 0 && udp.parsePacket() > 0) {
+    const String sender = udp.remoteIP().toString();
+    String packet; packet.reserve(1536);
+    while (udp.available()) { const char c = char(udp.read()); if (packet.length()<1536) packet+=c; }
+    rememberSsdpCandidate(sender);
+    const String location = ssdpLocationIp(packet);
+    if (location.length() && location!=sender) rememberSsdpCandidate(location);
+  }
+}
 void discoverZones(bool keepMenuVisible) {
   if (scanPhase == 1) discoveryUdp.stop();
+  ssdpNotifyUdp.stop();
   if (WiFi.status() != WL_CONNECTED) {
     menuMessage = "WI-FI OFF";
     drawScreen();
@@ -1611,7 +1646,9 @@ void discoverZones(bool keepMenuVisible) {
   if (!keepMenuVisible) { menuScreen = MenuScreen::Scan; selectedItem = 0; }
   menuMessage = "SEARCHING";
   scanHost = 1; scanPortIndex = 0;
+  for (int i=0;i<ssdpSeenCount;++i) ssdpSeen[i]=""; ssdpSeenCount=0;
   cloudDiscoveryUdp.begin(53308);
+  ssdpNotifyUdp.beginMulticast(IPAddress(239,255,255,250),1900);
   scanStartedAt = millis();
   scanPhase = 1;
   if (discoveryUdp.begin(0)) {
@@ -1630,6 +1667,7 @@ void discoverZones(bool keepMenuVisible) {
 
 void pollZoneScan() {
   if (!scanPhase) return;
+  collectSsdpCandidates(ssdpNotifyUdp, 2);
   for (int i = 0; i < 2; ++i) {
     const int length = cloudDiscoveryUdp.parsePacket(); if (length <= 0) break;
     const String ip = cloudDiscoveryUdp.remoteIP().toString();
@@ -1638,18 +1676,12 @@ void pollZoneScan() {
   }
   if (menuScreen != MenuScreen::Scan &&
       !scanInBackground) {
-    discoveryUdp.stop(); cloudDiscoveryUdp.stop();
+    discoveryUdp.stop(); cloudDiscoveryUdp.stop(); ssdpNotifyUdp.stop();
     scanPhase = 0;
     return;
   }
   if (scanPhase == 1) {
-    for (int count = 0; count < 5; ++count) {
-      const int length = discoveryUdp.parsePacket();
-      if (length <= 0) break;
-      const String ip = discoveryUdp.remoteIP().toString();
-      while (discoveryUdp.available()) discoveryUdp.read();
-      rememberZone(ip);
-    }
+    collectSsdpCandidates(discoveryUdp, 5);
     if (millis() - scanStartedAt < 1400) return;
     discoveryUdp.stop();
     scanPhase = 2;
@@ -1691,7 +1723,7 @@ void pollZoneScan() {
     return;
   }
   scanPhase = 0;
-  cloudDiscoveryUdp.stop();
+  cloudDiscoveryUdp.stop(); ssdpNotifyUdp.stop();
   if (!scanInBackground) menuScreen = scanReturnScreen;
   selectedItem = 0;
   menuMessage = String(zoneCount) + " ZONES FOUND";
@@ -2354,7 +2386,7 @@ void pollButton() {
       String body;
       if (menuScreen == MenuScreen::Scan) {
         discoveryUdp.stop();
-        scanPhase = 0; cloudDiscoveryUdp.stop();
+        scanPhase = 0; cloudDiscoveryUdp.stop(); ssdpNotifyUdp.stop();
         setMenu(scanReturnScreen);
       } else if (menuScreen == MenuScreen::DeviceInfo || menuScreen == MenuScreen::NetworkInfo ||
                  menuScreen == MenuScreen::MemoryInfo) {
@@ -2385,7 +2417,7 @@ void pollButton() {
     longPressHandled = true;
     if (menuScreen == MenuScreen::Scan) {
       discoveryUdp.stop();
-      scanPhase = 0; cloudDiscoveryUdp.stop();
+      scanPhase = 0; cloudDiscoveryUdp.stop(); ssdpNotifyUdp.stop();
       setMenu(scanReturnScreen);
     } else if (menuScreen == MenuScreen::DeviceInfo || menuScreen == MenuScreen::NetworkInfo ||
                menuScreen == MenuScreen::MemoryInfo)
