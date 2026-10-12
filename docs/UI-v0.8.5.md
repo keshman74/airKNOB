@@ -9,3 +9,5 @@ Found devices appear immediately in menu/web and can be selected before the swee
 API profile detection accepts recognizable A31/A97/A98/A33. A response with uuid and Linkplay identity fields at /httpapi.asp is retained as LINKPLAY if the exact hardware label is unknown; generic HTTP/HTTPS controls are available, A31-specific TCP/DSP are not assumed. All candidates still pass actual API validation.
 
 Tests: actual endpoint detector including stale generation and generic profile; SSDP LOCATION parser; scheduler duplicate suppression/retry cap/restart/timer wrap/full subnet; progressive web selection and stop control; existing encoder, OTA and versioned artifact tests retained. Stable main channel unchanged; experimental versioned firmware published.
+
+Actual worker code was also compiled for host C++11 with deterministic socket/FreeRTOS mocks and tested in a background thread: main enqueue during delayed API, cancellation drops old-generation results, restart verifies again, exactly four maximum probe sockets and no leaked mock sockets. This checks concurrency logic, not ESP32 radio/socket timing. TLS worker stack increased to 12 KiB.

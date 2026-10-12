@@ -1707,7 +1707,7 @@ void discoveryWorker(void*) {
         ++cursor; ++launched;
         const int connected=::connect(fd,reinterpret_cast<sockaddr*>(&address),sizeof(address));
         if(connected==0) { ledger.offer(host,port,millis()); ::close(fd); break; }
-        if(errno==EINPROGRESS || errno==EWOULDBLOCK || errno==EALREADY) { p={fd,host,port,millis()}; break; }
+        if(errno==EINPROGRESS || errno==EWOULDBLOCK || errno==EALREADY) { p.fd=fd; p.host=host; p.port=port; p.started=millis(); break; }
         ::close(fd);
       }
     }
@@ -1727,7 +1727,7 @@ bool initDiscoveryWorker() {
   if(discoveryTaskHandle) return true;
   discoveryJobs=xQueueCreate(32,sizeof(DiscoveryJob));
   discoveryResults=xQueueCreate(24,sizeof(DiscoveryResult));
-  if(!discoveryJobs || !discoveryResults || xTaskCreatePinnedToCore(discoveryWorker,"zone-search",8192,nullptr,1,&discoveryTaskHandle,0)!=pdPASS) {
+  if(!discoveryJobs || !discoveryResults || xTaskCreatePinnedToCore(discoveryWorker,"zone-search",12288,nullptr,1,&discoveryTaskHandle,0)!=pdPASS) {
     if(discoveryJobs) vQueueDelete(discoveryJobs); if(discoveryResults) vQueueDelete(discoveryResults);
     discoveryJobs=discoveryResults=nullptr; discoveryTaskHandle=nullptr; return false;
   }

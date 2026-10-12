@@ -21,6 +21,7 @@ jobs:
       - run: node tests/web-zones.test.cjs
       - run: python3 tests/encoder.test.py
       - run: python3 tests/discovery.test.py
+      - run: python3 tests/worker.test.py
       - run: g++ -std=c++17 tests/scheduler.test.cpp -o /tmp/discovery-scheduler-test && /tmp/discovery-scheduler-test
       - run: python3 tests/ssdp.test.py
       - run: python3 tests/manifest.test.py
