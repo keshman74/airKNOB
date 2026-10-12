@@ -40,7 +40,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.1";
+constexpr char kFirmwareVersion[] = "0.8.2";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -165,6 +165,9 @@ uint32_t lastGroupPollAt = 0;
 bool rebootAfterResponse = false;
 bool otaUploadFailed = false;
 bool otaUploadFinished = false;
+bool otaActive = false;
+size_t otaExpectedBytes = 0, otaWrittenBytes = 0;
+uint32_t otaDrawAt = 0;
 int volume = kInitialVolume;
 bool playing = false;
 volatile uint8_t encoderPrevious = 0;
@@ -329,7 +332,7 @@ uint32_t scanStartedAt = 0;
 uint8_t scanPhase = 0;
 bool scanInBackground = false;
 int scanHost = 1;
-String infoLines[5];
+String infoLines[6];
 int infoLineCount = 0;
 bool muted = false;
 int selectedPreset = 1;
@@ -345,6 +348,10 @@ int marqueeOffset = 0;
 uint16_t artPixels[kArtSize * kArtSize] = {};
 int sourceWidth = 0;
 int sourceHeight = 0;
+bool localVolumePending() {
+  return volumeDirty || (menuScreen == MenuScreen::Player && encoderRead != encoderWrite) ||
+         (volumeChangedAt && millis() - volumeChangedAt < 500);
+}
 void drawScreen();
 void drawVolumeUpdate();
 void drawMenu();
@@ -730,7 +737,7 @@ void pollDevice() {
     if (title != trackTitle) { artworkReady = artworkAttempted = false; currentArtworkUrl = ""; lastArtworkPollAt = millis() - kArtworkPollMs; }
     trackTitle = title; trackArtist = artist; reportedArtworkUrl = String(alt["TrackImage"] | "");
     playing = newPlaying; deviceOnline = true;
-    if (!volumeDirty && !doc["DevVolumeL"].isNull() && remoteVolume >= 0 && remoteVolume <= 100) { changed |= volume != remoteVolume; volume = remoteVolume; }
+    if (!localVolumePending() && !doc["DevVolumeL"].isNull() && remoteVolume >= 0 && remoteVolume <= 100) { changed |= volume != remoteVolume; volume = remoteVolume; }
     if (changed && menuScreen == MenuScreen::Player) drawScreen();
     return;
   }
@@ -774,7 +781,7 @@ void pollDevice() {
     changed = true;
   }
   bool volumeChanged = false;
-  if (!volumeDirty && remoteVolume >= 0 && remoteVolume <= 100 && remoteVolume != volume) {
+  if (!localVolumePending() && remoteVolume >= 0 && remoteVolume <= 100 && remoteVolume != volume) {
     volume = remoteVolume;
     volumeChanged = true;
   }
@@ -785,6 +792,8 @@ void pollDevice() {
 void sendVolumeWhenReady() {
   if (!volumeDirty || millis() - lastVolumeSentAt < kVolumeSendDelayMs ||
       static_cast<int32_t>(millis() - volumeRetryAt) < 0) return;
+  // Do not block the UI waiting for the A31 TCP command spacing.
+  if (activeEndpoint.chip == Chip::A31 && lastTcpSentAt && millis() - lastTcpSentAt < 220) return;
   String body;
   char command[16];
   snprintf(command, sizeof(command), "MCU+VOL+%03d", volume);
@@ -1093,6 +1102,7 @@ void drawMenu() {
              40, 210, 16, 1, 0, accentColor(), TFT_BLACK);
 }
 
+int firstInfoLine() { return constrain(selectedItem - 2, 0, max(0, infoLineCount - 5)); }
 void drawInformation() {
   display.fillScreen(TFT_BLACK);
   display.setTextDatum(middle_center);
@@ -1101,9 +1111,10 @@ void drawInformation() {
   drawWindow(menuScreen == MenuScreen::MemoryInfo ? "KNOB INFO" :
              menuScreen == MenuScreen::DeviceInfo ? "ZONE INFO" : "ZONE IP",
              35, 27, 17, 1, 0, TFT_WHITE, TFT_BLACK);
-  for (int i = 0; i < infoLineCount; ++i) {
+  const int first = firstInfoLine();
+  for (int i = first; i < min(infoLineCount, first + 5); ++i) {
     const uint16_t color = i == selectedItem ? TFT_WHITE : display.color565(150, 150, 150);
-    drawWindow(infoLines[i], 30, 59 + i * 29, 18, 1,
+    drawWindow(infoLines[i], 30, 59 + (i-first) * 29, 18, 1,
                i == selectedItem ? marqueeOffset : 0, color, TFT_BLACK);
   }
   drawWindow("HOLD: BACK", 70, 204, 10, 1, 0, accentColor(), TFT_BLACK);
@@ -1314,7 +1325,7 @@ loadZones();
   page += "<label>Player IP<input name='device' value='" + htmlEscape(deviceIp) + "'></label>";
   page += F("<button type='submit'>Save and restart</button></form></section>"
     "<section><h2>Обновление прошивки</h2><p>Обновление файлом firmware.bin:</p>"
-    "<form method='post' action='/update' enctype='multipart/form-data'>"
+    "<form id='firmware-upload' method='post' action='/update' enctype='multipart/form-data'>"
     "<input name='firmware' type='file' accept='.bin' required><button type='submit'>Upload firmware</button></form></section>"
     "<section><h2>Factory reset</h2><p>Erases KNOB Wi-Fi credentials and network/A31 settings.</p>"
     "<form method='post' action='/reset' onsubmit=\"return confirm('Erase KNOB settings?')\">"
@@ -1324,8 +1335,30 @@ loadZones();
 <p>GitHub: keshman74/airKNOB · текущая версия: )HTML") + kFirmwareVersion + R"HTML(</p>
 <button id="ota-check" type="button">Проверить обновление</button>
 <button id="ota-install" type="button" disabled>Установить обновление</button>
-<p id="ota-status"></p><script>
-let otaManifest=null;
+<progress id="ota-progress" max="100" value="0" hidden style="width:100%;accent-color:white"></progress><p id="ota-status"></p><script>
+let otaManifest=null,uploadBusy=false;
+const uploadProgress=document.getElementById('ota-progress');
+function uploadFirmware(form,size){
+ return new Promise((resolve,reject)=>{
+ const xhr=new XMLHttpRequest();xhr.open('POST','/update');xhr.timeout=180000;
+ xhr.setRequestHeader('X-Firmware-Size',String(size));
+ uploadProgress.hidden=false;uploadProgress.value=0;
+ xhr.upload.onprogress=e=>{if(e.lengthComputable){const percent=Math.min(99,Math.floor(e.loaded/e.total*100));uploadProgress.value=percent;otaStatus.textContent='Передача прошивки: '+percent+'%';}};
+ xhr.upload.onload=()=>{otaStatus.textContent='Проверка и завершение записи на KNOB…';};
+ xhr.onload=()=>{if(xhr.status>=200&&xhr.status<300){uploadProgress.value=100;resolve(xhr.responseText);}else reject(Error(xhr.responseText||'HTTP '+xhr.status));};
+ xhr.onerror=()=>reject(Error('Соединение потеряно. Проверьте статус на панели перед повтором.'));
+ xhr.ontimeout=()=>reject(Error('Нет ответа от KNOB. Проверьте статус на панели.'));
+ xhr.onabort=()=>reject(Error('Передача прервана'));xhr.send(form);
+ });
+}
+function updateSucceeded(){otaStatus.textContent='Прошивка установлена. KNOB перезагружается…';setTimeout(()=>location.replace('/'),7000);}
+document.getElementById('firmware-upload').onsubmit=async e=>{
+ e.preventDefault();if(uploadBusy)return;
+ const file=e.target.querySelector('input[type=file]').files[0];if(!file)return;
+ uploadBusy=true;const button=e.target.querySelector('button');button.disabled=true;otaInstall.disabled=true;
+ try{await uploadFirmware(new FormData(e.target),file.size);updateSucceeded();}
+ catch(err){otaStatus.textContent='Ошибка обновления: '+err.message;button.disabled=false;uploadBusy=false;}
+};
 const otaStatus=document.getElementById('ota-status'),otaInstall=document.getElementById('ota-install');
 async function otaFetch(url){const c=new AbortController(),t=setTimeout(()=>c.abort(),90000);try{const r=await fetch(url,{cache:'no-store',signal:c.signal});if(!r.ok)throw Error('HTTP '+r.status);return r;}finally{clearTimeout(t);}}
 document.getElementById('ota-check').onclick=async()=>{
@@ -1339,13 +1372,12 @@ document.getElementById('ota-check').onclick=async()=>{
  }catch(e){otaStatus.textContent='Обновление недоступно: '+e.message;}
 };
 otaInstall.onclick=async()=>{
- if(!otaManifest)return;otaInstall.disabled=true;
+ if(!otaManifest||uploadBusy)return;uploadBusy=true;otaInstall.disabled=true;
  try{otaStatus.textContent='Скачиваем версию '+otaManifest.version+'…';const bytes=new Uint8Array(await (await otaFetch(otaManifest.url+'?md5='+otaManifest.md5)).arrayBuffer());
  if(bytes.length!==otaManifest.size||bytes[0]!==0xe9)throw Error('Неверный размер или формат прошивки');
  const form=new FormData();form.append('md5',otaManifest.md5);form.append('firmware',new Blob([bytes]),'firmware.bin');
- otaStatus.textContent='Передаём прошивку в KNOB…';const r=await fetch('/update',{method:'POST',body:form});const result=await r.text();if(!r.ok)throw Error(result);
- otaStatus.textContent='Обновление установлено. KNOB перезагружается; обновите страницу через несколько секунд.';
- }catch(e){otaStatus.textContent='Ошибка обновления: '+e.message;otaInstall.disabled=false;}
+ await uploadFirmware(form,bytes.length);updateSucceeded();
+ }catch(e){otaStatus.textContent='Ошибка обновления: '+e.message;otaInstall.disabled=false;uploadBusy=false;}
 };
 </script></section>)HTML";
   page.replace("</html>", "<meta name='knob-version' content='" + String(kFirmwareVersion) + "'>" + updateUi + "</html>");
@@ -1357,7 +1389,20 @@ otaInstall.onclick=async()=>{
 bool webScanRequested = false;
 void discoverZones(bool keepMenuVisible = false);
 
+void drawOtaProgress(const String& state, bool force = false) {
+  if (!force && millis()-otaDrawAt < 120) return;
+  otaDrawAt = millis();
+  display.setBrightness(kNormalBrightness); displayDimmed = false; lastInteractionAt = millis();
+  const int percent = otaUploadFinished ? 100 : otaExpectedBytes ? min(size_t(99), otaWrittenBytes*100/otaExpectedBytes) : 0;
+  if (force) { display.fillScreen(TFT_BLACK); drawWindow("FIRMWARE UPDATE",30,46,18,1,0,TFT_WHITE,TFT_BLACK); }
+  drawWindow(state,30,80,18,1,0,TFT_WHITE,TFT_BLACK);
+  display.fillRoundRect(30,118,180,16,5,display.color565(55,55,55));
+  if (percent) display.fillRoundRect(30,118,180*percent/100,16,5,TFT_WHITE);
+  drawWindow(otaExpectedBytes || otaUploadFinished ? String(percent)+"%" : String(otaWrittenBytes/1024)+" KB",45,151,15,1,0,TFT_WHITE,TFT_BLACK);
+}
 void startSettingsWeb() {
+  const char* otaHeaders[] = {"X-Firmware-Size"};
+  settingsServer.collectHeaders(otaHeaders, 1);
   settingsServer.on("/", HTTP_GET, []() { webPage(); });
   settingsServer.on("/zones", HTTP_GET, []() {
     DynamicJsonDocument doc(8192);
@@ -1428,7 +1473,9 @@ void startSettingsWeb() {
     }
     settings.putString("device", device.toString());
     settings.putUChar("chip", 0);
-    settingsServer.send(200, "text/plain; charset=utf-8", "Saved. KNOB is restarting; reconnect at the new IP.");
+    const String target = "http://" + (fixed ? ip.toString() : WiFi.localIP().toString()) + "/";
+    settingsServer.send(200, "text/html; charset=utf-8",
+      "<!doctype html><meta charset='utf-8'><style>body{background:#000;color:#fff;font:18px Arial;padding:32px}a{color:#fff}</style><p>Настройки сохранены. KNOB перезагружается…</p><p><a href='" + target + "'>Открыть главную страницу</a></p><script>history.replaceState(null,'','/');setTimeout(()=>location.replace('" + target + "'),7000);</script>");
     rebootAfterResponse = true;
   });
   settingsServer.on("/reset", HTTP_POST, []() {
@@ -1443,11 +1490,20 @@ void startSettingsWeb() {
       const bool ok = otaUploadFinished && !otaUploadFailed && !Update.hasError();
       settingsServer.send(ok ? 200 : 500, "text/plain; charset=utf-8",
         ok ? "Firmware installed. KNOB is restarting." : "Firmware update failed; existing firmware is retained.");
+      otaActive = false;
+      portENTER_CRITICAL(&encoderMux); encoderRead=encoderWrite; encoderAccumulator=0; portEXIT_CRITICAL(&encoderMux);
+      drawOtaProgress(ok ? "RESTARTING" : "UPDATE FAILED", true);
       if (ok) rebootAfterResponse = true;
     },
     []() {
       HTTPUpload& upload = settingsServer.upload();
       if (upload.status == UPLOAD_FILE_START) {
+        otaActive = true;
+        const long requestedSize = settingsServer.header("X-Firmware-Size").toInt();
+        otaExpectedBytes = requestedSize > 0 && requestedSize <= 8*1024*1024 ? size_t(requestedSize) : 0;
+        otaWrittenBytes = 0;
+        portENTER_CRITICAL(&encoderMux); encoderRead=encoderWrite; encoderAccumulator=0; portEXIT_CRITICAL(&encoderMux);
+        drawOtaProgress("RECEIVING", true);
         otaUploadFinished = false;
         otaUploadFailed = !upload.filename.endsWith(".bin") || !Update.begin(UPDATE_SIZE_UNKNOWN);
         const String expectedMd5 = settingsServer.arg("md5");
@@ -1457,12 +1513,15 @@ void startSettingsWeb() {
           if (!valid || !Update.setMD5(expectedMd5.c_str())) { Update.abort(); otaUploadFailed = true; }
         }
       } else if (upload.status == UPLOAD_FILE_WRITE && !otaUploadFailed) {
-        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) otaUploadFailed = true;
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) { Update.abort(); otaUploadFailed = true; drawOtaProgress("WRITE FAILED", true); }
+        else { otaWrittenBytes += upload.currentSize; drawOtaProgress("WRITING FLASH"); }
       } else if (upload.status == UPLOAD_FILE_END && !otaUploadFailed) {
+        drawOtaProgress("VERIFYING", true);
         if (!Update.end(true)) otaUploadFailed = true;
         else otaUploadFinished = true;
+        drawOtaProgress(otaUploadFinished ? "COMPLETE" : "UPDATE FAILED", true);
       } else if (upload.status == UPLOAD_FILE_ABORTED) {
-        Update.abort(); otaUploadFailed = true;
+        Update.abort(); otaUploadFailed = true; otaActive = false; drawOtaProgress("UPLOAD ABORTED", true);
       }
     });
   settingsServer.begin();
@@ -1640,7 +1699,7 @@ bool sendA31EqPreset(int index) {
 void handleTcpMessage(const String& message) {
   if (message.startsWith("AXX+VOL+") && message.length() >= 11) {
     const int n = message.substring(8, 11).toInt();
-    if (n >= 0 && n <= 100 && !volumeDirty && volume != n) {
+    if (n >= 0 && n <= 100 && !localVolumePending() && volume != n) {
       volume = n;
       if (menuScreen == MenuScreen::Player) drawVolumeUpdate();
     }
@@ -1728,7 +1787,7 @@ void pollA31Tcp(String* reply = nullptr) {
         DynamicJsonDocument doc(8192);
         if (!deserializeJson(doc, event)) {
           const String command = doc["cmd"] | "";
-          if (command == "volume" && !volumeDirty && !doc["level"].isNull()) {
+          if (command == "volume" && !localVolumePending() && !doc["level"].isNull()) {
             const int n = doc["level"].as<int>(); if (n >= 0 && n <= 100) { volume = n; if (menuScreen == MenuScreen::Player) drawVolumeUpdate(); }
           } else if (command == "mute") muted = String(doc["state"] | "") == "on";
           else if (command == "play" || command == "pause") { playing = command == "play"; if (menuScreen == MenuScreen::Player) drawScreen(); }
@@ -2092,8 +2151,9 @@ void chooseMenuItem() {
         infoLines[1] = "RAM USED " + String((heapTotal - heapFree) / 1024) + " KB";
         infoLines[2] = "RAM FREE " + String(heapFree / 1024) + " KB";
         infoLines[3] = "FIRMWARE " + String(ESP.getSketchSize() / 1024) + " KB";
-        infoLines[4] = "IP: " + WiFi.localIP().toString();
-        infoLineCount = 5;
+        infoLines[4] = "VERSION " + String(kFirmwareVersion);
+        infoLines[5] = "IP: " + WiFi.localIP().toString();
+        infoLineCount = 6;
         setMenu(MenuScreen::MemoryInfo);
         return;
       } else { discoverZones(); return; }
@@ -2187,8 +2247,16 @@ void updateDisplaySleep() {
 void pollEncoder() {
   portENTER_CRITICAL(&encoderMux);
   if (encoderRead == encoderWrite) { portEXIT_CRITICAL(&encoderMux); return; }
-  const int direction = encoderSteps[encoderRead];
+  int direction = encoderSteps[encoderRead];
   encoderRead = (encoderRead + 1) & 127;
+  int volumeTarget = constrain(volume + direction*kVolumePerDetent, 0, 100);
+  if (menuScreen == MenuScreen::Player) {
+    // Drain in one snapshot, preserving reversals and clipping at the limits.
+    while (encoderRead != encoderWrite) {
+      volumeTarget = constrain(volumeTarget + encoderSteps[encoderRead]*kVolumePerDetent, 0, 100);
+      encoderRead = (encoderRead + 1) & 127;
+    }
+  }
   portEXIT_CRITICAL(&encoderMux);
   recordInteraction();
   {
@@ -2221,7 +2289,7 @@ void pollEncoder() {
       drawMenu();
       return;
     }
-    const int next = constrain(volume + direction * kVolumePerDetent, 0, 100);
+    const int next = volumeTarget;
     if (next != volume) {
       volume = next;
       volumeDirty = true;
@@ -2375,14 +2443,15 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.1: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.2: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
 
 void loop() {
   if (WiFi.status() == WL_CONNECTED) settingsServer.handleClient();
-  if (rebootAfterResponse) { delay(250); ESP.restart(); }
+  if (rebootAfterResponse) { delay(500); ESP.restart(); }
+  if (otaActive) { delay(1); return; }
   if (WiFi.status() == WL_CONNECTED) handleScreenshot();
   pollEncoder();
   pollButton();
@@ -2416,7 +2485,7 @@ void loop() {
       marqueeLastAt = millis();
       if (marqueeOffset == 0) marqueeStartedAt = millis();
       if (infoPage)
-        drawWindow(infoLines[selectedItem], 30, 59 + selectedItem * 29, 18, 1,
+        drawWindow(infoLines[selectedItem], 30, 59 + (selectedItem-firstInfoLine()) * 29, 18, 1,
                    marqueeOffset, TFT_WHITE, TFT_BLACK);
       else if (menuScreen != MenuScreen::Player)
         drawSansMenu(menuLabel(selectedItem), 32, 99, 176, 26, true,
