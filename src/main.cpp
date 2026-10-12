@@ -10,6 +10,7 @@
 #include <ArduinoJson.h>
 #include <math.h>
 #include <PNGdec.h>
+#include "artwork_thumbnail.h"
 #include <JPEGDEC.h>
 #include <esp_heap_caps.h>
 #include <atomic>
@@ -47,7 +48,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.9";
+constexpr char kFirmwareVersion[] = "0.8.10";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -549,7 +550,7 @@ String fetchSoapArtworkAddress() {
   return url;
 }
 
-bool downloadAndDecodeArt(String url) {
+bool downloadAndDecodeArtOriginal(String url) {
   // This exact Qobuz CDN hostname was verified to serve the same cover over
   // HTTP 200. Do not downgrade other HTTPS hosts without checking them.
 
@@ -567,7 +568,7 @@ bool downloadAndDecodeArt(String url) {
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
-    http.addHeader("User-Agent","airControl-KNOB/0.8.9");
+    http.addHeader("User-Agent","airControl-KNOB/0.8.10");
     http.addHeader("Accept","image/*,*/*;q=0.8");
     http.addHeader("Accept-Encoding","identity");
     const int status = http.GET();
@@ -642,6 +643,15 @@ bool downloadAndDecodeArt(String url) {
     return ok;
   }
   return false;
+}
+
+bool downloadAndDecodeArt(String url) {
+  const String small(artworkThumbnail(std::string(url.c_str())).c_str());
+  if(small!=url) {
+    if(downloadAndDecodeArtOriginal(small)) {Serial.println("Artwork: service thumbnail used");return true;}
+    Serial.println("Artwork: thumbnail unavailable; trying original");
+  }
+  return downloadAndDecodeArtOriginal(url);
 }
 
 void pollArtwork() {
@@ -2682,7 +2692,7 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.9: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.10: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
