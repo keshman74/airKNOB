@@ -11,6 +11,7 @@
 #include <math.h>
 #include <PNGdec.h>
 #include "artwork_thumbnail.h"
+#include "preset_resume.h"
 #include <JPEGDEC.h>
 #include <esp_heap_caps.h>
 #include <atomic>
@@ -48,7 +49,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.11";
+constexpr char kFirmwareVersion[] = "0.8.12";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -178,6 +179,8 @@ size_t otaExpectedBytes = 0, otaWrittenBytes = 0;
 uint32_t otaDrawAt = 0;
 int volume = kInitialVolume;
 bool playing = false;
+PresetResume presetResume;
+String presetResumeZone;
 volatile uint8_t encoderPrevious = 0;
 volatile int encoderAccumulator = 0;
 portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
@@ -262,6 +265,7 @@ const char* chipName(Chip chip) {
 }
 bool isCloud() { return activeEndpoint.chip == Chip::A33; }
 void applyEndpoint(const Endpoint& endpoint) {
+  presetResume.cancel();
   activeEndpoint = endpoint;
   graphicKnown = false;
   a31Tcp.stop(); tcpInputLength = 0; lastTcpAttemptAt = 0; a31TcpIp = "";
@@ -636,7 +640,7 @@ bool downloadAndDecodeArtOriginal(String url) {
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
-    http.addHeader("User-Agent","airControl-KNOB/0.8.11");
+    http.addHeader("User-Agent","airControl-KNOB/0.8.12");
     http.addHeader("Accept","image/*,*/*;q=0.8");
     http.addHeader("Accept-Encoding","identity");
     const int status = http.GET();
@@ -1005,6 +1009,32 @@ void sendVolumeWhenReady() {
   if (!ok) drawScreen();
 }
 
+
+int readA33PresetPlayback() {
+  String body;
+  if(!readEndpoint(deviceIp,activeEndpoint,"getPlayerStatus",body,600)) return -1;
+  DynamicJsonDocument doc(4096);
+  if(deserializeJson(doc,body)) return -1;
+  String state=cleanMedia(doc["PlayStatus"].as<String>());
+  if(parsePlayback(state)<0) state=cleanMedia(doc["status"].as<String>());
+  return parsePlayback(state);
+}
+void servicePresetResume() {
+  if(!presetResume.pending) return;
+  if(!isCloud() || deviceIp!=presetResumeZone || isSlave || presetResume.expired(millis())) {presetResume.cancel();return;}
+  if(!presetResume.ready(millis()) || volumeDirty || WiFi.status()!=WL_CONNECTED) return;
+  presetResume.cancel(); // At most one read and one resume, never repeat choicePreset.
+  const int state=readA33PresetPlayback();
+  lastA31ActivityAt=millis();
+  if(state==1) {lastPollAt=millis()-kFallbackPollIntervalMs;return;}
+  // Unknown status uses the hardware-tested choice -> 2s -> resume fallback.
+  // This is not claimed necessary for every preset. No automatic retry on Not.
+  String body;
+  const bool ok=readEndpoint(deviceIp,activeEndpoint,"setPlayerCmd:resume",body,800);
+  Serial.println(ok ? "A33 preset resume sent" : "A33 preset resume failed");
+  lastA31ActivityAt=millis();
+  lastPollAt=millis()-kFallbackPollIntervalMs;
+}
 
 void drawVolumeArc() {
   // Paint each arc pixel exactly once in its final colour: never grey then yellow.
@@ -2338,6 +2368,7 @@ void chooseMenuItem() {
           drawMenu();return;
         }
         if(presetZone!=deviceIp || selectedItem<0 || selectedItem>=devicePresetCount) {menuMessage="REFRESH PRESETS";break;}
+        presetResume.cancel();
         const int slot=devicePresets[selectedItem].slot;
         if(!isCloud() && slot>10) {menuMessage="SLOT NOT VERIFIED";break;}
         // Refresh immediately before acting: a phone may have changed the group.
@@ -2348,6 +2379,7 @@ void chooseMenuItem() {
         const bool sent=isCloud() ? request("choicePreset:"+String(slot),body) :
             (mcuCommand(command) || request("MCUKeyShortClick:"+String(slot),body));
         if (sent) {
+        if(isCloud()) {presetResumeZone=deviceIp;presetResume.schedule(millis());}
         menuScreen = MenuScreen::Player;
         artworkReady = artworkAttempted = false;
         currentArtworkUrl = "";
@@ -2362,6 +2394,7 @@ void chooseMenuItem() {
       menuMessage = "PRESET FAILED";
       break;
     case MenuScreen::Source:
+      presetResume.cancel();
       menuMessage = request("setPlayerCmd:switchmode:" + (sourceCapabilitiesKnown ? discoveredSourceModes[selectedItem] : isCloud() ? (selectedItem == 4 ? String("HDMI ARC") : String(kSourceItems[selectedItem])) : String(kSourceModes[selectedItem])), body)
                         ? "SOURCE SELECTED" : "SOURCE FAILED";
       if (menuMessage == "SOURCE SELECTED") {
@@ -2659,6 +2692,7 @@ void pollButton() {
       } else if (menuScreen != MenuScreen::Player) {
         chooseMenuItem();
       } else {
+        presetResume.cancel(); // Manual transport always overrides preset auto-start.
         const bool requestedPlaying = !playing;
         const String command = requestedPlaying ? "setPlayerCmd:resume" : "setPlayerCmd:pause";
         const String tcpCommand = requestedPlaying ? "MCU+PLY-PLA" : "MCU+PLY-PUS";
@@ -2776,7 +2810,7 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.11: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.12: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
@@ -2828,6 +2862,7 @@ void loop() {
     }
   }
   sendVolumeWhenReady();
+  servicePresetResume();
   if (WiFi.status() == WL_CONNECTED && !volumeDirty &&
       millis() - lastGroupPollAt >= (groupKnown && isSlave ? kSlavePollMs : kGroupPollMs))
     refreshGroupStatus();

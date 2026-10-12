@@ -27,6 +27,7 @@ jobs:
       - run: g++ -std=c++11 -Isrc tests/art-thumbnail.test.cpp -o /tmp/art-thumbnail && /tmp/art-thumbnail
       - run: python3 tests/xml-media.test.py
       - run: python3 tests/presets.test.py
+      - run: python3 tests/preset-resume.test.py
       - run: g++ -std=c++17 tests/scheduler.test.cpp -o /tmp/discovery-scheduler-test && /tmp/discovery-scheduler-test
       - run: python3 tests/ssdp.test.py
       - run: python3 tests/manifest.test.py
