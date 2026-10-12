@@ -3,6 +3,7 @@ import subprocess
 s=Path('src/main.cpp').read_text()
 poll=s[s.index('void pollArtwork() {'):s.index('\nString decodeMetadata')]
 a=s.index('  const bool feedbackActive=');b=s.index('  if (artworkReady)',a);feedback=s[a:b]
+a=s.index('void invalidateArtwork()');b=s.index('int pngLine(',a);updates=s[a:b]
 code=r'''
 #include <string>
 #include <vector>
@@ -14,7 +15,8 @@ struct String:std::string{using std::string::string;String(const std::string&s):
 enum class MenuScreen{Player,Zone};MenuScreen menuScreen=MenuScreen::Player;
 const int WL_CONNECTED=1,TFT_WHITE=65535,TFT_BLACK=0;int wifiState=1;struct Wifi{int status(){return wifiState;}} WiFi;
 uint32_t now=10000,lastA31ActivityAt=0,lastArtAttemptAt=0,feedbackUntil=12000;uint32_t millis(){return now;}
-String currentArtworkUrl="old",lastArtAttemptUrl,offeredUrl,fallbackUrl;
+uint32_t marqueeStartedAt=0,marqueeLastAt=0,lastArtworkPollAt=0;int marqueeOffset=0;const uint32_t kArtworkPollMs=20000;
+String currentArtworkUrl="old",lastArtAttemptUrl,offeredUrl,fallbackUrl,reportedArtworkUrl,deviceIp="192.168.0.35",trackTitle="old song",trackArtist="old artist",currentMediaUri="old URI";
 bool artworkReady=true,artworkAttempted=true,cloud=false,decodeOk=false,deviceOnline=true,groupKnown=false,isSlave=false,playing=true;
 int feedbackKind=0,draws=0,downloads=0,maxDrawY=0;
 struct Logger{void println(const char*){}} Serial;
@@ -22,22 +24,26 @@ struct Display{uint16_t color565(int,int,int){return 1;}void fillRect(int,int y,
 uint16_t accentColor(){return 1;}void drawWindow(const String&,int,int y,int,int,int,int,int){maxDrawY=std::max(maxDrawY,y+18);}
 String cleanArtworkUrl(const String&s){return s;}String fetchArtworkAddress(){return offeredUrl;}String fetchSoapArtworkAddress(){return fallbackUrl;}
 bool isCloud(){return cloud;}bool downloadAndDecodeArt(const String&){++downloads;return decodeOk;}void drawScreen(){++draws;}
-'''+poll+'void drawFeedback(){\n'+feedback+'}\n'+r'''
+'''+updates+poll+'void drawFeedback(){\n'+feedback+'}\n'+r'''
 int main(){
  for(const char*s:{"plays","play","playing","1"})assert(playbackState(s)==1);
  for(const char*s:{"pause","paused","stop","stopped","0"})assert(playbackState(s)==0);
  for(const char*s:{"","unknown","buffering","null","2"})assert(playbackState(s)==-1);
- offeredUrl="";pollArtwork();assert(artworkReady&&currentArtworkUrl=="old"&&downloads==0&&draws==0);
- offeredUrl="new";decodeOk=false;pollArtwork();assert(artworkReady&&currentArtworkUrl=="old"&&draws==0);
- int attempts=downloads;now+=1000;pollArtwork();assert(downloads==attempts);
- now+=5000;decodeOk=true;pollArtwork();assert(artworkReady&&currentArtworkUrl=="new"&&draws==1);
+ offeredUrl="";pollArtwork();assert(!artworkReady&&currentArtworkUrl.empty()&&downloads==0&&draws==1);
+ artworkReady=true;currentArtworkUrl="old";offeredUrl="new";decodeOk=false;pollArtwork();assert(!artworkReady&&currentArtworkUrl.empty()&&draws==2);
+ int attempts=downloads;now+=1000;pollArtwork();assert(downloads==attempts&&!artworkReady);
+ now+=5000;decodeOk=true;pollArtwork();assert(artworkReady&&currentArtworkUrl=="new"&&draws==3);
  attempts=downloads;now+=30000;pollArtwork();assert(downloads==attempts);
- offeredUrl="unreachable";fallbackUrl="new";decodeOk=false;pollArtwork();assert(artworkReady&&currentArtworkUrl=="new"&&draws==1);
- artworkReady=false;offeredUrl="new";lastArtAttemptUrl="";decodeOk=true;pollArtwork();assert(artworkReady&&draws==2);
+ assert(updateTrackMetadata("New station","","new URI"));assert(trackArtist.empty()&&!artworkReady&&currentArtworkUrl.empty());
+ artworkReady=true;currentArtworkUrl="new";assert(updateTrackMetadata("Another song","","new URI"));assert(artworkReady); // same station/URI, ICY title only
+ assert(updateTrackMetadata("Another song","","other URI"));assert(!artworkReady); // URI changes even if title is the same
+ trackArtist="old artist";assert(updateTrackMetadata("Another song","","other URI"));assert(trackArtist.empty());
+ offeredUrl="new station cover";decodeOk=true;lastArtAttemptUrl="";pollArtwork();assert(artworkReady);
+ offeredUrl="";pollArtwork();assert(!artworkReady&&currentArtworkUrl.empty());
  now=10000;feedbackUntil=12000;
  for(int kind=1;kind<=3;++kind){feedbackKind=kind;maxDrawY=0;drawFeedback();assert(maxDrawY<=62);}
  groupKnown=isSlave=true;for(int kind=1;kind<=2;++kind){feedbackKind=kind;maxDrawY=0;drawFeedback();assert(maxDrawY<=62);}
- std::cout<<"Actual artwork poll and feedback: empty/failed retention, retry, atomic commit selection, playback aliases, unknown state and cover bounds passed\n";
+ std::cout<<"Actual media handling: no stale cover on absence/failure/new station, empty artist clears, URI identity, retry and header bounds passed\n";
 }
 '''
 Path('/tmp/knob_media.cpp').write_text(code)

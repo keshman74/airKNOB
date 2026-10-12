@@ -1,0 +1,9 @@
+# v0.8.7 no stale cover/artist policy
+
+User report: v0.8.6 improved behavior across chips but some metadata remains incorrect. Explicit preference supersedes v0.8.6's retain-old-cover-on-failure policy: if current artwork was not obtained, leave its area empty rather than display the previous station/album. Artist line must clear when current Internet Radio has no artist metadata.
+
+Implemented: cover invalidation on changed media URI, or changed nonempty title when URI is unavailable; same known URI permits ICY song-title updates without assuming a station change. Missing/failed current artwork leaves a black area, without NO COVER text. Complete-image staging, retry cooldown and non-overlapping feedback remain. Before committing a download, check that selected device/title still matches its request context.
+
+Full HTTP status snapshots replace the current artist string, including an empty value. TCP metadata patches preserve omitted artist only if title/identity is unchanged; explicit empty artist or changed title clears it. A33 chooses the active nonempty AllMate object, otherwise AltMate, rather than merging a previous AltMate artist/cover into the current AllMate station. A getPlayerStatus artist is accepted only with a nonempty matching player title. A33 getMetaInfo artwork fallback likewise requires title agreement; no guessing an old artwork association.
+
+Current media URI is reset with endpoint selection. Metadata updates and identity/cover invalidation share one helper; URI-only changes also invalidate a cover even when title/artist text is unchanged. Programmatic tests extract actual helper/poll/header code and cover previous-song-to-radio-without-artist, changed URI/same title, absent/failed cover, retry, same-stream ICY update, and header bounds. Previously confirmed asynchronous discovery remains unchanged. Hardware verification pending.
