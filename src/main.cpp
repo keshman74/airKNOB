@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include "discovery_scheduler.h"
+#include "media_state.h"
 #include "utf8_mono_font.h"
 #include "sans_menu_font.h"
 #include "preset_names.h"
@@ -46,7 +47,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.5";
+constexpr char kFirmwareVersion[] = "0.8.6";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -372,6 +373,9 @@ uint32_t marqueeStartedAt = 0;
 uint32_t marqueeLastAt = 0;
 int marqueeOffset = 0;
 uint16_t artPixels[kArtSize * kArtSize] = {};
+uint16_t nextArtPixels[kArtSize * kArtSize] = {};
+String lastArtAttemptUrl;
+uint32_t lastArtAttemptAt = 0;
 int sourceWidth = 0;
 int sourceHeight = 0;
 bool localVolumePending() {
@@ -396,7 +400,7 @@ int pngLine(PNGDRAW* line) {
   if (y < 0 || y >= kArtSize) return 1;
   for (int x = 0; x < targetW; ++x) {
     const int sourceX = x * line->iWidth / targetW;
-    artPixels[y * kArtSize + (kArtSize - targetW) / 2 + x] = pixels[sourceX];
+    nextArtPixels[y * kArtSize + (kArtSize - targetW) / 2 + x] = pixels[sourceX];
   }
   return 1;
 }
@@ -414,29 +418,40 @@ int jpegBlock(JPEGDRAW* block) {
       const int sx = block->x + bx;
       const int dx = (kArtSize - targetW) / 2 + sx * targetW / sourceWidth;
       if (dx >= 0 && dx < kArtSize)
-        artPixels[dy * kArtSize + dx] = block->pPixels[by * block->iWidth + bx];
+        nextArtPixels[dy * kArtSize + dx] = block->pPixels[by * block->iWidth + bx];
     }
   }
   return 1;
 }
 
 String decodeXml(String xml) {
+  for (int round=0; round<3; ++round) {
   xml.replace("&lt;", "<");
   xml.replace("&gt;", ">");
   xml.replace("&quot;", "\"");
   xml.replace("&apos;", "'");
   xml.replace("&amp;", "&");
+  }
   return xml;
 }
 
 String xmlValue(const String& xml, const char* localName) {
-  const int name = xml.indexOf(localName);
-  if (name < 0) return "";
-  const int open = xml.indexOf('>', name);
-  if (open < 0) return "";
-  const int close = xml.indexOf('<', open + 1);
-  if (close < 0) return "";
-  return xml.substring(open + 1, close);
+  int cursor=0;
+  while ((cursor=xml.indexOf('<',cursor))>=0) {
+    const int start=++cursor;
+    if(xml[start]=='/' || xml[start]=='!' || xml[start]=='?') continue;
+    int end=start;
+    while(end<int(xml.length()) && xml[end]!='>' && xml[end]!=' ' && xml[end]!='/' && xml[end]!='\t' && xml[end]!='\r' && xml[end]!='\n') ++end;
+    const String name=xml.substring(start,end);
+    const int colon=name.lastIndexOf(':');
+    if(name.substring(colon+1)!=localName) continue;
+    const int open=xml.indexOf('>',end),close=xml.indexOf("</"+name+">",open+1);
+    if(open<0 || close<0) return "";
+    String value=xml.substring(open+1,close);value.trim();
+    if(value.startsWith("<![CDATA[") && value.endsWith("]]>")) value=value.substring(9,value.length()-3);
+    return value;
+  }
+  return "";
 }
 
 void pollEncoder();
@@ -451,8 +466,19 @@ void serviceVolumeDuringArtwork() {
 }
 
 bool request(const String& command, String& response);
+String cleanMedia(String value) {
+  value.trim(); String lower=value; lower.toLowerCase();
+  return lower=="unknown" || lower=="null" || lower=="http_music" ? String("") : value;
+}
+String cleanArtworkUrl(String url) {
+  url=decodeXml(cleanMedia(url));
+  if(url.startsWith("/")) url=String(activeEndpoint.tls?"https://":"http://")+deviceIp+":"+String(activeEndpoint.port)+url;
+  return url.startsWith("http://") || url.startsWith("https://") ? url : String("");
+}
+int parsePlayback(String value) { value.trim(); value.toLowerCase(); return playbackState(value.c_str()); }
+String fetchSoapArtworkAddress();
 String fetchArtworkAddress() {
-  if (isCloud()) return reportedArtworkUrl;
+  if (isCloud() && cleanArtworkUrl(reportedArtworkUrl).length()) return cleanArtworkUrl(reportedArtworkUrl);
   if (activeEndpoint.chip != Chip::A31) {
     String body;
     if (request("getMetaInfo", body)) {
@@ -460,13 +486,18 @@ String fetchArtworkAddress() {
       if (!deserializeJson(info, body)) {
         JsonVariant data = info["metaData"].isNull() ? info.as<JsonVariant>() : info["metaData"].as<JsonVariant>();
         const String title = String(data["title"] | ""), artist = String(data["artist"] | "");
-        if (title.length() && (title != trackTitle || artist != trackArtist)) { trackTitle = title; trackArtist = artist; marqueeOffset = 0; marqueeStartedAt = millis(); }
+        // Reading artwork must not overwrite transport metadata with a different title source.
         String art = String(data["albumArtURI"] | "");
         if (art.isEmpty()) art = String(data["albumArtURI "] | "");
+        art=cleanArtworkUrl(art);
         if (art.length()) return art;
       }
     }
   }
+  if (isCloud()) return ""; // gmrender state is independent of A33 main playback
+  return fetchSoapArtworkAddress();
+}
+String fetchSoapArtworkAddress() {
   WiFiClient client;
   client.setTimeout(2);
   const String body = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:GetPositionInfo xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"><InstanceID>0</InstanceID></u:GetPositionInfo></s:Body></s:Envelope>";
@@ -489,7 +520,10 @@ String fetchArtworkAddress() {
     delay(1);
   }
   client.stop();
-  String metadata = decodeXml(xmlValue(response, "TrackMetaData"));
+  String raw=xmlValue(response,"TrackMetaData");
+  if(raw.isEmpty()) raw=xmlValue(response,"CurrentTrackMetaData");
+  if(raw.isEmpty()) raw=xmlValue(response,"AVTransportURIMetaData");
+  String metadata = decodeXml(raw);
   String url = decodeXml(xmlValue(metadata, "albumArtURI"));
   if (url.startsWith("/")) url = "http://" + deviceIp + ":49152" + url;
   return url;
@@ -506,12 +540,16 @@ bool downloadAndDecodeArt(String url) {
     WiFiClient plain; WiFiClientSecure secure;
     secure.setInsecure(); secure.setHandshakeTimeout(2);
     HTTPClient http;
+    http.useHTTP10(true);
     http.setConnectTimeout(750);
     http.setTimeout(1800);
     const bool began = url.startsWith("https://") ? http.begin(secure, url) : http.begin(plain, url);
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
+    http.addHeader("User-Agent","airControl-KNOB/0.8.6");
+    http.addHeader("Accept","image/*,*/*;q=0.8");
+    http.addHeader("Accept-Encoding","identity");
     const int status = http.GET();
     if (status >= 300 && status < 400) {
       String next = http.header("Location");
@@ -528,7 +566,8 @@ bool downloadAndDecodeArt(String url) {
       http.end();
       return false;
     }
-    const size_t capacity = psramFound() ? kMaxArtworkBytes : 96 * 1024;
+    const int declaredSize=http.getSize();
+    const size_t capacity = declaredSize>0 ? size_t(declaredSize) : psramFound() ? kMaxArtworkBytes : 96*1024;
     uint8_t* bytes = static_cast<uint8_t*>(psramFound()
         ? heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
         : malloc(capacity));
@@ -548,8 +587,9 @@ bool downloadAndDecodeArt(String url) {
     }
     http.end();
     bool ok = false;
-    memset(artPixels, 0, sizeof(artPixels));
-    if (length > 8 && bytes[0] == 0x89 && bytes[1] == 'P' && bytes[2] == 'N') {
+    memset(nextArtPixels, 0, sizeof(nextArtPixels));
+    const bool complete=declaredSize<=0 || length==size_t(declaredSize);
+    if (complete && length > 8 && bytes[0] == 0x89 && bytes[1] == 'P' && bytes[2] == 'N') {
       if (pngDecoder.openRAM(bytes, length, pngLine) == PNG_SUCCESS) {
         sourceWidth = pngDecoder.getWidth();
         sourceHeight = pngDecoder.getHeight();
@@ -558,7 +598,7 @@ bool downloadAndDecodeArt(String url) {
              pngDecoder.decode(nullptr, 0) == PNG_SUCCESS;
         pngDecoder.close();
       }
-    } else if (length > 3 && bytes[0] == 0xFF && bytes[1] == 0xD8) {
+    } else if (complete && length > 3 && bytes[0] == 0xFF && bytes[1] == 0xD8) {
       if (jpegDecoder.openRAM(bytes, length, jpegBlock)) {
         sourceWidth = jpegDecoder.getWidth();
         sourceHeight = jpegDecoder.getHeight();
@@ -570,6 +610,7 @@ bool downloadAndDecodeArt(String url) {
       }
     }
     free(bytes);
+    if (ok) memcpy(artPixels,nextArtPixels,sizeof(artPixels));
     Serial.printf("Artwork: %s (%u bytes)\n", ok ? "decoded" : "decode failed", static_cast<unsigned>(length));
     return ok;
   }
@@ -578,18 +619,22 @@ bool downloadAndDecodeArt(String url) {
 
 void pollArtwork() {
   if (WiFi.status() != WL_CONNECTED || menuScreen != MenuScreen::Player) return;
-  const String url = fetchArtworkAddress();
-  lastA31ActivityAt = millis();
-  if (url.isEmpty()) {
-    if (artworkReady) { artworkReady = false; currentArtworkUrl = ""; artworkAttempted = false; drawScreen(); }
-    return;
+  String url=cleanArtworkUrl(fetchArtworkAddress());
+  lastA31ActivityAt=millis();
+  if(url.isEmpty()) return; // keep the last successfully decoded cover
+  if(url==currentArtworkUrl && artworkReady) return;
+  if(url==lastArtAttemptUrl && millis()-lastArtAttemptAt<5000) return;
+  lastArtAttemptUrl=url; lastArtAttemptAt=millis();
+  bool ok=downloadAndDecodeArt(url);
+  if(!ok && !isCloud()) {
+    const String fallback=cleanArtworkUrl(fetchSoapArtworkAddress());
+    if(fallback.length() && fallback!=url) {
+      if(fallback==currentArtworkUrl && artworkReady) return;
+      if(downloadAndDecodeArt(fallback)) {url=fallback;ok=true;}
+    }
   }
-  if (url == currentArtworkUrl && artworkAttempted) return;
-  currentArtworkUrl = url;
-  artworkAttempted = true;
-  artworkReady = downloadAndDecodeArt(url);
-  Serial.println(artworkReady ? "Artwork ready" : "Artwork unavailable");
-  drawScreen();
+  if(ok) { currentArtworkUrl=url; artworkAttempted=artworkReady=true; drawScreen(); }
+  Serial.println(ok?"Artwork committed":"Artwork retry pending; previous cover retained");
 }
 
 String decodeMetadata(const char* value) {
@@ -753,16 +798,34 @@ void pollDevice() {
     return;
   }
   if (isCloud()) {
-    JsonVariant alt = doc["AllMate"].isNull() ? doc["AltMate"].as<JsonVariant>() : doc["AllMate"].as<JsonVariant>();
-    String state = String(doc["PlayState"] | ""); if (state.isEmpty()) state = String(alt["PlayState"] | ""); state.toLowerCase();
-    const bool newPlaying = state == "play" || state == "playing";
+    JsonVariant alt=doc["AllMate"].as<JsonVariant>(),other=doc["AltMate"].as<JsonVariant>();
+    String state=cleanMedia(doc["PlayState"].as<String>());
+    if(parsePlayback(state)<0) state=cleanMedia(alt["PlayState"].as<String>());
+    if(parsePlayback(state)<0) state=cleanMedia(other["PlayState"].as<String>());
+    DynamicJsonDocument player(4096);
+    if(parsePlayback(state)<0) {
+      String extra;
+      if(request("getPlayerStatus",extra) && !deserializeJson(player,extra)) {
+        state=cleanMedia(player["PlayStatus"].as<String>());
+        if(parsePlayback(state)<0) state=cleanMedia(player["status"].as<String>());
+      }
+    }
+    const int parsedState=parsePlayback(state);
+    const bool newPlaying=parsedState<0 ? playing : parsedState==1;
     const int remoteVolume = doc["DevVolumeL"].as<int>();
     String muteState = String(doc["VolumeState"] | ""); muteState.toLowerCase(); muted = muteState == "mute";
-    const String title = String(alt["TrackTitle"] | ""), artist = String(alt["TrackArtist"] | "");
-    bool changed = !deviceOnline || playing != newPlaying || title != trackTitle || artist != trackArtist;
-    if (title != trackTitle) { artworkReady = artworkAttempted = false; currentArtworkUrl = ""; lastArtworkPollAt = millis() - kArtworkPollMs; }
-    trackTitle = title; trackArtist = artist; reportedArtworkUrl = String(alt["TrackImage"] | "");
-    playing = newPlaying; deviceOnline = true;
+    String title=cleanMedia(String(alt["TrackTitle"]|"")),artist=cleanMedia(String(alt["TrackArtist"]|""));
+    if(title.isEmpty()) title=cleanMedia(String(other["TrackTitle"]|""));
+    if(artist.isEmpty()) artist=cleanMedia(String(other["TrackArtist"]|""));
+    if(title.isEmpty()) title=cleanMedia(decodeMetadata(player["Title"]|""));
+    if(artist.isEmpty()) artist=cleanMedia(decodeMetadata(player["Artist"]|""));
+    String art=cleanArtworkUrl(String(alt["TrackImage"]|""));
+    if(art.isEmpty()) art=cleanArtworkUrl(String(other["TrackImage"]|""));
+    bool changed=!deviceOnline || playing!=newPlaying;
+    if(title.length() && title!=trackTitle) {trackTitle=title;changed=true;artworkAttempted=false;lastArtworkPollAt=millis()-kArtworkPollMs;}
+    if(artist.length() && artist!=trackArtist) {trackArtist=artist;changed=true;}
+    if(art.length() && art!=reportedArtworkUrl) {reportedArtworkUrl=art;lastArtworkPollAt=millis()-kArtworkPollMs;}
+    playing=newPlaying;deviceOnline=true;
     if (!localVolumePending() && !doc["DevVolumeL"].isNull() && remoteVolume >= 0 && remoteVolume <= 100) { changed |= volume != remoteVolume; volume = remoteVolume; }
     if (changed && menuScreen == MenuScreen::Player) drawScreen();
     return;
@@ -786,8 +849,10 @@ void pollDevice() {
   }
   Serial.printf("A31 status: remote vol=%d, shown=%d, pending=%d\n",
                 remoteVolume, volume, volumeDirty ? 1 : 0);
-  const String newTitle = decodeMetadata(doc["Title"] | "");
-  const String newArtist = decodeMetadata(doc["Artist"] | "");
+  const String parsedTitle=cleanMedia(decodeMetadata(doc["Title"]|""));
+  const String newTitle=parsedTitle.isEmpty()?trackTitle:parsedTitle;
+  const String parsedArtist=cleanMedia(decodeMetadata(doc["Artist"]|""));
+  const String newArtist=parsedArtist.isEmpty()?trackArtist:parsedArtist;
   bool changed = !deviceOnline || newPlaying != playing;
   deviceOnline = true;
   playing = newPlaying;
@@ -797,9 +862,8 @@ void pollDevice() {
     marqueeOffset = 0;
     if (newTitle != trackTitle && deviceOnline && !trackTitle.isEmpty()) {
       // A new track/station must not keep showing the previous cover.
-      artworkReady = false;
+      // Titles may alternate between transport and ICY metadata; replace only on successful decode.
       artworkAttempted = false;
-      currentArtworkUrl = "";
       lastArtworkPollAt = millis() - kArtworkPollMs;
     }
     trackTitle = newTitle;
@@ -1207,9 +1271,18 @@ void drawScreen() {
   drawVolumeArc();
   display.setTextColor(TFT_WHITE, TFT_BLACK);
   display.setTextSize(1);
-  drawWindow(deviceOnline ? (groupKnown && isSlave ? "SLAVE MODE" : (playing ? "PLAY" : "PAUSE")) : "OFFLINE",
-             60, 32, 12, 1, 0,
-             deviceOnline && groupKnown && isSlave ? display.color565(255, 60, 60) : TFT_WHITE, TFT_BLACK);
+  const bool feedbackActive=feedbackKind && static_cast<int32_t>(feedbackUntil-millis())>0;
+  const bool slaveLabel=deviceOnline && groupKnown && isSlave;
+  if(!feedbackActive || slaveLabel) drawWindow(deviceOnline ? (slaveLabel ? "SLAVE MODE" : (playing?"PLAY":"PAUSE")) : "OFFLINE",
+    60,32,12,1,0,slaveLabel?display.color565(255,60,60):TFT_WHITE,TFT_BLACK);
+  if(feedbackActive) {
+    if(feedbackKind==3) drawWindow("SELECTED",60,32,12,1,0,accentColor(),TFT_BLACK);
+    else {
+      const int x=slaveLabel?54:111,y=31;
+      if(feedbackKind==2) {display.fillRect(x,y,5,18,TFT_WHITE);display.fillRect(x+11,y,5,18,TFT_WHITE);}
+      else for(int column=0;column<18;++column) {const int h=18-column;display.drawLine(x+column,y+9-h/2,x+column,y+9+h/2,TFT_WHITE);}
+    }
+  }
   if (artworkReady) {
     display.setSwapBytes(true);
     display.pushImage(82, 62, kArtSize, kArtSize, artPixels);
@@ -1219,12 +1292,7 @@ void drawScreen() {
   }
   drawMetadata();
   drawVolumeLabel();
-  if (feedbackKind && static_cast<int32_t>(feedbackUntil - millis()) > 0) {
-    display.fillRoundRect(65, 77, 110, 64, 10, TFT_BLACK);
-    if (feedbackKind == 3) drawWindow("SELECTED", 72, 100, 12, 1, 0, accentColor(), TFT_BLACK);
-    else if (feedbackKind == 2) { display.fillRect(101, 90, 10, 35, TFT_WHITE); display.fillRect(125, 90, 10, 35, TFT_WHITE); }
-    else for (int x=104; x<=136; ++x) { int h=(136-x)*36/32; display.drawLine(x,108-h/2,x,108+h/2,TFT_WHITE); }
-  }
+
 }
 
 void handleScreenshot() {
@@ -1891,13 +1959,12 @@ void handleTcpMessage(const String& message) {
     if (start < 0 || end <= start) return;
     StaticJsonDocument<2048> doc;
     if (deserializeJson(doc, message.substring(start, end + 1))) return;
-    const String title = decodeMetadata(doc["title"] | "");
-    const String artist = decodeMetadata(doc["artist"] | "");
+    const String incomingTitle=cleanMedia(decodeMetadata(doc["title"]|"")),incomingArtist=cleanMedia(decodeMetadata(doc["artist"]|""));
+    const String title=incomingTitle.isEmpty()?trackTitle:incomingTitle,artist=incomingArtist.isEmpty()?trackArtist:incomingArtist;
     if (title != trackTitle || artist != trackArtist) {
       trackTitle = title;
       trackArtist = artist;
-      artworkReady = artworkAttempted = false;
-      currentArtworkUrl = "";
+      artworkAttempted = false;
       lastArtworkPollAt = millis() - kArtworkPollMs;
       marqueeOffset = 0;
       marqueeStartedAt = marqueeLastAt = millis();
@@ -2604,7 +2671,7 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.5: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.6: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
