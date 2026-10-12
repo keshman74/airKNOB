@@ -1,6 +1,6 @@
 from pathlib import Path
 import subprocess
-s=Path('src/main.cpp').read_text();a=s.index('String decodeXml(');b=s.index('\nvoid pollEncoder();',a)
+s=Path('src/main.cpp').read_text();a=s.index('String decodeXml(');b=s.index('\nbool request(const String& command, String& response);',a)
 code=r'''
 #include <string>
 #include <algorithm>

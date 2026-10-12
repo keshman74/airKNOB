@@ -22,7 +22,7 @@
 #include "media_state.h"
 #include "utf8_mono_font.h"
 #include "sans_menu_font.h"
-#include "preset_names.h"
+
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 
@@ -48,7 +48,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.10";
+constexpr char kFirmwareVersion[] = "0.8.11";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -364,6 +364,10 @@ int scanHost = 1;
 String infoLines[7];
 int infoLineCount = 0;
 bool muted = false;
+struct DevicePreset { int slot=0; String name; };
+DevicePreset devicePresets[20];
+int devicePresetCount=0;
+String presetZone;
 int selectedPreset = 1;
 String trackTitle;
 String trackArtist;
@@ -474,6 +478,70 @@ String xmlValue(const String& xml, const char* localName) {
   return "";
 }
 
+bool request(const String& command, String& response);
+String cleanPresetName(String name) {
+  name=decodeXml(name);name.trim();
+  const int suffix=name.lastIndexOf('_');
+  if(suffix>=0 && name.substring(suffix).startsWith("_#~")) {
+    const String stamp=name.substring(suffix+3);
+    if(stamp.length()==19 && stamp[4]=='-' && stamp[7]=='-' && stamp[10]==' ' && stamp[13]==':' && stamp[16]==':') name=name.substring(0,suffix);
+  }
+  name.trim();return name;
+}
+bool parseKeyPresets(const String& response) {
+  devicePresetCount=0;
+  const String context=decodeXml(xmlValue(response,"QueueContext"));
+  if(context.indexOf("<KeyList")<0 || context.indexOf("</KeyList>")<0) return false;
+  int maximum=xmlValue(context,"MaxNumber").toInt();
+  if(maximum<1 || maximum>20) return false;
+  for(int slot=1;slot<=maximum;++slot) {
+    char key[8];snprintf(key,sizeof(key),"Key%d",slot);
+    const String entry=decodeXml(xmlValue(context,key));
+    const String name=cleanPresetName(xmlValue(entry,"Name"));
+    if(name.length()) {devicePresets[devicePresetCount].slot=slot;devicePresets[devicePresetCount++].name=name;}
+  }
+  return true;
+}
+bool readDevicePresets() {
+  devicePresetCount=0;presetZone=deviceIp;
+  if(isCloud()) {
+    String body;if(!request("getPresetListInfo",body)) return false;
+    StaticJsonDocument<256> filter;
+    filter["Presets"][0]["PresetNumber"]=true;filter["Presets"][0]["PresetName"]=true;
+    DynamicJsonDocument doc(4096);
+    if(deserializeJson(doc,body,DeserializationOption::Filter(filter))) return false;
+    if(!doc["Presets"].is<JsonArray>()) return false;
+    for(JsonObject item:doc["Presets"].as<JsonArray>()) {
+      const int slot=item["PresetNumber"].as<int>();
+      const String name=cleanPresetName(item["PresetName"].as<String>());
+      if(slot>=1 && slot<=12 && name.length() && devicePresetCount<20) {
+        devicePresets[devicePresetCount].slot=slot;devicePresets[devicePresetCount++].name=name;
+      }
+    }
+    return true;
+  }
+  WiFiClient client;HTTPClient http;http.useHTTP10(true);
+  http.setConnectTimeout(350);http.setTimeout(1200);
+  if(!http.begin(client,"http://"+deviceIp+":49152/upnp/control/PlayQueue1")) return false;
+  http.addHeader("Content-Type","text/xml; charset=utf-8");
+  http.addHeader("SOAPAction","\"urn:schemas-wiimu-com:service:PlayQueue:1#GetKeyMapping\"");
+  const String body="<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:GetKeyMapping xmlns:u=\"urn:schemas-wiimu-com:service:PlayQueue:1\"/></s:Body></s:Envelope>";
+  const int status=http.POST(body);
+  if(status!=200 || http.getSize()>65536) {http.end();return false;}
+  // Bound even a response without Content-Length. Never log token-bearing metadata.
+  String response;response.reserve(4096);char chunk[513];auto* stream=http.getStreamPtr();
+  uint32_t lastData=millis();
+  while((http.connected() || stream->available()) && millis()-lastData<1200) {
+    const int available=stream->available();
+    if(available>0) {
+      const int count=stream->readBytes(chunk,min(available,512));
+      if(response.length()+count>65536) {http.end();return false;}
+      chunk[count]=0;response+=chunk;lastData=millis();
+    } else delay(1);
+  }
+  http.end();return parseKeyPresets(response);
+}
+
 void pollEncoder();
 void sendVolumeWhenReady();
 
@@ -568,7 +636,7 @@ bool downloadAndDecodeArtOriginal(String url) {
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
-    http.addHeader("User-Agent","airControl-KNOB/0.8.10");
+    http.addHeader("User-Agent","airControl-KNOB/0.8.11");
     http.addHeader("Accept","image/*,*/*;q=0.8");
     http.addHeader("Accept-Encoding","identity");
     const int status = http.GET();
@@ -1120,7 +1188,7 @@ int joinZoneIndex(int item) {
 int menuCount() {
   switch (menuScreen) {
     case MenuScreen::Home: return 5;
-    case MenuScreen::Presets: return 10;
+    case MenuScreen::Presets: return devicePresetCount + 1;
     case MenuScreen::Source: return sourceCapabilitiesKnown ? discoveredSourceCount : activeEndpoint.chip == Chip::A31 ? 7 : isCloud() ? 5 : 3;
     case MenuScreen::EqBands: return 12;
     case MenuScreen::Multiroom: return 4;
@@ -1138,7 +1206,7 @@ String menuLabel(int item) {
   if (item < 0 || item >= menuCount()) return "";
   switch (menuScreen) {
     case MenuScreen::Home: return kHomeItems[item];
-    case MenuScreen::Presets: return String(item + 1) + " " + kPresetNames[item];
+    case MenuScreen::Presets: return item==devicePresetCount ? String("Refresh") : String(devicePresets[item].slot)+" "+devicePresets[item].name;
     case MenuScreen::Source: return sourceCapabilitiesKnown ? discoveredSourceNames[item] : isCloud() && item == 4 ? "HDMI ARC" : kSourceItems[item];
     case MenuScreen::Multiroom: return kMultiroomItems[item];
     case MenuScreen::Join: {
@@ -1663,6 +1731,12 @@ void setMenu(MenuScreen screen) {
   marqueeStartedAt = marqueeLastAt = millis();
   marqueeOffset = 0;
   drawScreen();
+  if(screen==MenuScreen::Presets) {
+    menuMessage="READING";drawMenu();
+    const bool ok=readDevicePresets();
+    selectedItem=0;menuMessage=ok ? (devicePresetCount ? "" : "NO PRESETS") : "READ FAILED";
+    drawMenu();
+  }
 }
 
 String normalizedUuid(const String& original) {
@@ -2257,13 +2331,23 @@ void chooseMenuItem() {
     }
     case MenuScreen::Presets:
       {
+        if(selectedItem==devicePresetCount) {
+          menuMessage="READING";drawMenu();
+          const bool ok=readDevicePresets();selectedItem=0;
+          menuMessage=ok ? (devicePresetCount ? "" : "NO PRESETS") : "READ FAILED";
+          drawMenu();return;
+        }
+        if(presetZone!=deviceIp || selectedItem<0 || selectedItem>=devicePresetCount) {menuMessage="REFRESH PRESETS";break;}
+        const int slot=devicePresets[selectedItem].slot;
+        if(!isCloud() && slot>10) {menuMessage="SLOT NOT VERIFIED";break;}
         // Refresh immediately before acting: a phone may have changed the group.
         if (!refreshGroupStatus()) { menuMessage = "CHECK ZONE"; break; }
         if (isSlave) { menuMessage = "SLAVE: NO PRESET"; break; }
         char command[16];
-        snprintf(command, sizeof(command), "MCU+KEY+%03d", selectedItem + 1);
-        if (mcuCommand(command) ||
-            request((isCloud() ? "setPlayerCmd:playPreset:" : "MCUKeyShortClick:") + String(selectedItem + 1), body)) {
+        snprintf(command, sizeof(command), "MCU+KEY+%03d", slot);
+        const bool sent=isCloud() ? request("choicePreset:"+String(slot),body) :
+            (mcuCommand(command) || request("MCUKeyShortClick:"+String(slot),body));
+        if (sent) {
         menuScreen = MenuScreen::Player;
         artworkReady = artworkAttempted = false;
         currentArtworkUrl = "";
@@ -2692,7 +2776,7 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.10: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.11: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
