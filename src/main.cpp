@@ -13,6 +13,7 @@
 #include "artwork_thumbnail.h"
 #include "preset_resume.h"
 #include "preset_selection.h"
+#include "a98_presets.h"
 #include <JPEGDEC.h>
 #include <esp_heap_caps.h>
 #include <atomic>
@@ -50,7 +51,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.14";
+constexpr char kFirmwareVersion[] = "0.8.15";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -182,6 +183,10 @@ int volume = kInitialVolume;
 bool playing = false;
 PresetResume presetResume;
 String presetResumeZone;
+String a98Zone;
+uint32_t a98ArtworkEpoch=0,a98IncomingSeq=0;
+void resetA98State();
+void pollA98Events();
 volatile uint8_t encoderPrevious = 0;
 volatile int encoderAccumulator = 0;
 portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
@@ -266,6 +271,7 @@ const char* chipName(Chip chip) {
 }
 bool isCloud() { return activeEndpoint.chip == Chip::A33; }
 void applyEndpoint(const Endpoint& endpoint) {
+  if(a98Zone.length() && (a98Zone!=deviceIp || endpoint.chip!=Chip::A98)) resetA98State();
   presetResume.cancel();
   activeEndpoint = endpoint;
   graphicKnown = false;
@@ -531,8 +537,142 @@ bool parseWiiMPresets(JsonVariantConst doc) {
     if(devicePresets[j].slot<devicePresets[i].slot) std::swap(devicePresets[i],devicePresets[j]);
   return true;
 }
+// A98 callback receiver is separate from WebServer: Arduino WebServer does not
+// parse the UPnP NOTIFY verb. One bounded client, no waiting in the UI loop.
+a98::Model a98Model;
+WiFiServer a98EventServer(8081);
+WiFiClient a98EventClient;
+struct A98Subscription {String sid;uint32_t due=0,seq=0;bool hasSeq=false;};
+A98Subscription a98Subscriptions[2];
+struct A98Unsubscribe {String ip,sid;int service=0;};
+A98Unsubscribe a98OldSubscriptions[2];
+char a98EventBuffer[18433];size_t a98EventLength=0,a98HeaderLength=0;int a98BodyLength=0,a98EventService=-1;
+uint32_t a98ClientStarted=0,a98MetadataRetry=0,a98EventEpoch=0;
+bool a98MetadataLoaded=false,a98EventServerStarted=false;
+const char* a98EventPaths[]={"/upnp/event/PlayQueue1","/upnp/event/rendertransport1"};
+void resetA98State() {
+  for(int i=0;i<2;++i) {
+    if(a98Subscriptions[i].sid.length()) {a98OldSubscriptions[i].ip=a98Zone;a98OldSubscriptions[i].sid=a98Subscriptions[i].sid;a98OldSubscriptions[i].service=i;}
+    a98Subscriptions[i].sid="";a98Subscriptions[i].due=0;a98Subscriptions[i].hasSeq=false;
+  }
+  a98EventClient.stop();a98Model.clear();a98Zone="";a98MetadataLoaded=false;a98MetadataRetry=0;++a98EventEpoch;
+}
+void a98ActiveChanged(int before,bool wakePoll=true) {
+  if(before==a98Model.active) return;
+  ++a98ArtworkEpoch;
+  invalidateArtwork();if(wakePoll) lastPollAt=millis()-kFallbackPollIntervalMs;
+  if(menuScreen==MenuScreen::Presets) drawMenu();
+  else if(menuScreen==MenuScreen::Player) drawScreen();
+}
+void pollA98Events() {
+  if(!a98EventServerStarted) return;
+  if(!a98EventClient) {
+    a98EventClient=a98EventServer.available();if(!a98EventClient) return;
+    a98EventLength=a98HeaderLength=0;a98BodyLength=0;a98EventService=-1;a98ClientStarted=millis();
+    if(activeEndpoint.chip!=Chip::A98 || a98EventClient.remoteIP().toString()!=deviceIp) {a98EventClient.stop();return;}
+  }
+  int budget=2048;
+  while(a98EventClient.available() && budget-->0 && a98EventLength<sizeof(a98EventBuffer)-1) {
+    a98EventBuffer[a98EventLength++]=char(a98EventClient.read());a98EventBuffer[a98EventLength]=0;
+    if(!a98HeaderLength && a98EventLength>=4 && !memcmp(a98EventBuffer+a98EventLength-4,"\r\n\r\n",4)) {
+      a98HeaderLength=a98EventLength;
+      if(a98HeaderLength>2048) {a98EventClient.stop();return;}
+      a98::Notify header;
+      if(!a98::parseNotify(std::string(a98EventBuffer,a98HeaderLength),header)) {a98EventClient.print("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");a98EventClient.stop();return;}
+      const String path=String("/a98/")+String(a98EventEpoch)+"/";
+      for(int i=0;i<2;++i) if(header.path==std::string((path+String(i)).c_str()) && header.sid==std::string(a98Subscriptions[i].sid.c_str()) && a98Subscriptions[i].sid.length()) a98EventService=i;
+      if(a98EventService<0) {a98EventClient.print("HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");a98EventClient.stop();return;}
+      auto& sub=a98Subscriptions[a98EventService];
+      if(sub.hasSeq && !a98::newSequence(header.seq,sub.seq)) {a98EventClient.print("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");a98EventClient.stop();return;}
+      // Commit SEQ only with a complete body, not a truncated notification.
+      a98IncomingSeq=header.seq;a98BodyLength=header.length;
+    }
+    if(a98HeaderLength && a98EventLength>=a98HeaderLength+size_t(a98BodyLength)) {
+      a98EventClient.print("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+      a98EventClient.stop();auto& sub=a98Subscriptions[a98EventService];sub.seq=a98IncomingSeq;sub.hasSeq=true;
+      const int before=a98Model.active;
+      a98Model.event(a98EventService==0,std::string(a98EventBuffer+a98HeaderLength,a98BodyLength));
+      a98ActiveChanged(before);return;
+    }
+  }
+  if((!a98HeaderLength && a98EventLength>=2048) || a98EventLength>=sizeof(a98EventBuffer)-1 || millis()-a98ClientStarted>2000) a98EventClient.stop();
+}
+bool a98ReadKeyMapping(String& response) {
+  WiFiClient client;HTTPClient http;http.useHTTP10(true);http.setConnectTimeout(350);http.setTimeout(1200);
+  if(!http.begin(client,"http://"+deviceIp+":59152/upnp/control/PlayQueue1")) return false;
+  http.addHeader("Content-Type","text/xml; charset=utf-8");http.addHeader("SOAPAction","\"urn:schemas-wiimu-com:service:PlayQueue:1#GetKeyMapping\"");
+  const int status=http.POST("<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:GetKeyMapping xmlns:u=\"urn:schemas-wiimu-com:service:PlayQueue:1\"/></s:Body></s:Envelope>");
+  if(status!=200 || http.getSize()>65536){http.end();return false;}
+  auto* stream=http.getStreamPtr();char chunk[513];uint32_t last=millis();response="";
+  while((http.connected() || stream->available()) && millis()-last<1200) {
+    int available=stream->available();if(available>0){int n=stream->readBytes(chunk,min(available,512));if(response.length()+n>65536){http.end();return false;}chunk[n]=0;response+=chunk;last=millis();}else delay(1);
+  }
+  http.end();return true;
+}
+bool readA98Presets() {
+  String mapping;if(!a98ReadKeyMapping(mapping)) return false;
+  a98::Model next;if(!next.mapping(std::string(mapping.c_str()))) return false;
+  bool needsRoutines=false;for(const auto& key:next.keys) if(!key.routine.empty()) needsRoutines=true;
+  bool complete=true;
+  if(needsRoutines) {
+    String body;
+    if(request("getAllRoutines",body)) {
+      StaticJsonDocument<512> filter;auto entry=filter["routines"][0];entry["id"]=true;entry["index"]=true;entry["name"]=true;entry["steps"][0]["type"]=true;entry["steps"][0]["payload"]["input"]=true;
+      DynamicJsonDocument doc(8192);
+      if(deserializeJson(doc,body,DeserializationOption::Filter(filter)) || !doc["routines"].is<JsonArray>()) complete=false;
+      else for(JsonObject routine:doc["routines"].as<JsonArray>()) {
+        const std::string id=routine["id"] | "";
+        for(auto& key:next.keys) if(!key.routine.empty() && key.routine==id && (routine["index"].isNull() || routine["index"].as<int>()==key.slot)) {
+          const String name=routine["name"].as<String>();if(name.length()) key.label=name.c_str();
+          for(JsonObject step:routine["steps"].as<JsonArray>()) if(a98::lower(step["type"] | "")=="audioinput") {key.input=a98::inputName(step["payload"]["input"] | "");break;}
+        }
+      }
+    } else complete=false;
+  }
+  const int before=a98Model.active;
+  next.active=next.matchMedia(a98Model.lastQueue);next.lastQueue=a98Model.lastQueue;
+  if(a98Model.inputActive) {next.active=0;next.inputActive=true;for(const auto& old:a98Model.keys) if(old.slot==a98Model.active) next.active=next.matchInput(old.input);}
+  a98Model=next;devicePresetCount=0;
+  for(const auto& key:a98Model.keys) if(key.slot) {devicePresets[devicePresetCount].slot=key.slot;devicePresets[devicePresetCount++].name=key.label.c_str();}
+  presetZone=deviceIp;a98Zone=deviceIp;a98MetadataLoaded=true;a98MetadataRetry=millis()+60000;lastA31ActivityAt=millis();
+  a98ActiveChanged(before);if(!complete) Serial.println("A98 routines unavailable; unresolved slots labelled Routine");
+  return true;
+}
+void maintainA98Subscriptions() {
+  if(WiFi.status()!=WL_CONNECTED || volumeDirty || scanPhase || otaActive || localVolumePending()) return;
+  if(activeEndpoint.chip==Chip::A98 && !a98EventServerStarted){a98EventServer.begin();a98EventServerStarted=true;}
+  if(a98Zone.length() && (activeEndpoint.chip!=Chip::A98 || a98Zone!=deviceIp)) resetA98State();
+  for(auto& old:a98OldSubscriptions) if(old.sid.length()) {
+    WiFiClient client;HTTPClient http;http.setConnectTimeout(250);http.setTimeout(500);
+    if(http.begin(client,"http://"+old.ip+":59152"+a98EventPaths[old.service])) {http.addHeader("SID",old.sid);http.sendRequest("UNSUBSCRIBE");http.end();}
+    old.sid="";return;
+  }
+  if(activeEndpoint.chip!=Chip::A98) return;
+  if(a98Zone.isEmpty()) a98Zone=deviceIp;
+  if(!a98MetadataLoaded) {
+    if(int32_t(millis()-a98MetadataRetry)<0) return;
+    if(!readA98Presets()) a98MetadataRetry=millis()+30000;
+    return;
+  }
+  for(int i=0;i<2;++i) {auto& sub=a98Subscriptions[i];if(int32_t(millis()-sub.due)<0)continue;
+    WiFiClient client;HTTPClient http;http.setConnectTimeout(350);http.setTimeout(800);
+    if(!http.begin(client,"http://"+deviceIp+":59152"+a98EventPaths[i])) {sub.due=millis()+30000;return;}
+    const char* headers[]={"SID","TIMEOUT"};http.collectHeaders(headers,2);http.addHeader("TIMEOUT","Second-600");
+    if(sub.sid.length()) http.addHeader("SID",sub.sid);
+    else {http.addHeader("NT","upnp:event");http.addHeader("CALLBACK","<http://"+WiFi.localIP().toString()+":8081/a98/"+String(a98EventEpoch)+"/"+String(i)+">");}
+    const int status=http.sendRequest("SUBSCRIBE");
+    if(status==200 && http.header("SID").length()) {
+      const String sid=http.header("SID");if(sid!=sub.sid) sub.hasSeq=false;sub.sid=sid;
+      String timeout=http.header("TIMEOUT");int seconds=timeout.substring(timeout.indexOf('-')+1).toInt();if(seconds<30)seconds=600;seconds=min(seconds,3600);
+      sub.due=millis()+uint32_t(seconds)*500;
+    } else {sub.sid="";sub.hasSeq=false;sub.due=millis()+30000;}
+    http.end();lastA31ActivityAt=millis();return;
+  }
+}
+
 bool readDevicePresets() {
   devicePresetCount=0;presetZone=deviceIp;
+  if(activeEndpoint.chip==Chip::A98) return readA98Presets();
   if(isWiiMPresetChip()) {
     String body;if(!request("getPresetInfo",body)) return false;
     StaticJsonDocument<256> filter;
@@ -587,7 +727,7 @@ void sendVolumeWhenReady();
 void serviceVolumeDuringArtwork() {
   pollEncoder();
   sendVolumeWhenReady();
-  if (WiFi.status() == WL_CONNECTED) settingsServer.handleClient();
+  if (WiFi.status() == WL_CONNECTED) {settingsServer.handleClient();pollA98Events();}
 }
 
 bool request(const String& command, String& response);
@@ -673,7 +813,7 @@ bool downloadAndDecodeArtOriginal(String url) {
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
-    http.addHeader("User-Agent","airControl-KNOB/0.8.14");
+    http.addHeader("User-Agent","airControl-KNOB/0.8.15");
     http.addHeader("Accept","image/*,*/*;q=0.8");
     http.addHeader("Accept-Encoding","identity");
     const int status = http.GET();
@@ -762,8 +902,9 @@ bool downloadAndDecodeArt(String url) {
 void pollArtwork() {
   if (WiFi.status() != WL_CONNECTED || menuScreen != MenuScreen::Player) return;
   const String requestedDevice=deviceIp,requestedTitle=trackTitle;
+  const uint32_t requestedArtEpoch=a98ArtworkEpoch;
   String url=cleanArtworkUrl(fetchArtworkAddress());
-  if(deviceIp!=requestedDevice || trackTitle!=requestedTitle) return;
+  if(deviceIp!=requestedDevice || trackTitle!=requestedTitle || requestedArtEpoch!=a98ArtworkEpoch) return;
   lastA31ActivityAt=millis();
   if(url.isEmpty()) { const bool redraw=artworkReady; invalidateArtwork(); if(redraw) drawScreen(); return; }
   if(url==currentArtworkUrl && artworkReady) return;
@@ -777,7 +918,7 @@ void pollArtwork() {
       if(downloadAndDecodeArt(fallback)) {url=fallback;ok=true;}
     }
   }
-  if(deviceIp!=requestedDevice || trackTitle!=requestedTitle) return;
+  if(deviceIp!=requestedDevice || trackTitle!=requestedTitle || requestedArtEpoch!=a98ArtworkEpoch) return;
   if(ok) { currentArtworkUrl=url; artworkAttempted=artworkReady=true; drawScreen(); }
   else { const bool redraw=artworkReady; artworkReady=artworkAttempted=false; currentArtworkUrl=""; if(redraw) drawScreen(); }
   Serial.println(ok?"Artwork committed":"Artwork unavailable; cover area left blank");
@@ -1004,6 +1145,9 @@ void pollDevice() {
   playing = newPlaying;
   const String uri=cleanMedia(decodeMetadata(doc["uri"]|doc["url"]|""));
   changed |= updateTrackMetadata(newTitle,newArtist,uri);
+  if(activeEndpoint.chip==Chip::A98 && a98Subscriptions[1].sid.isEmpty()) {
+    const int before=a98Model.active;a98Model.mode(doc["mode"].as<int>());a98ActiveChanged(before,false);
+  }
   bool volumeChanged = false;
   if (!localVolumePending() && remoteVolume >= 0 && remoteVolume <= 100 && remoteVolume != volume) {
     volume = remoteVolume;
@@ -1269,7 +1413,7 @@ String menuLabel(int item) {
   if (item < 0 || item >= menuCount()) return "";
   switch (menuScreen) {
     case MenuScreen::Home: return kHomeItems[item];
-    case MenuScreen::Presets: return item==devicePresetCount ? String("Refresh") : String(devicePresets[item].slot)+" "+devicePresets[item].name;
+    case MenuScreen::Presets: return item==devicePresetCount ? String("Refresh") : String(devicePresets[item].slot)+(activeEndpoint.chip==Chip::A98 && a98Model.active==devicePresets[item].slot ? " * " : " ")+devicePresets[item].name;
     case MenuScreen::Source: return sourceCapabilitiesKnown ? discoveredSourceNames[item] : isCloud() && item == 4 ? "HDMI ARC" : kSourceItems[item];
     case MenuScreen::Multiroom: return kMultiroomItems[item];
     case MenuScreen::Join: {
@@ -2853,13 +2997,13 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.14: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.15: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
 
 void loop() {
-  if (WiFi.status() == WL_CONNECTED) settingsServer.handleClient();
+  if (WiFi.status() == WL_CONNECTED) {pollA98Events();settingsServer.handleClient();}
   if (rebootAfterResponse) { delay(500); ESP.restart(); }
   if (otaActive) { delay(1); return; }
   if (WiFi.status() == WL_CONNECTED && !scanPhase) handleScreenshot();
@@ -2906,6 +3050,7 @@ void loop() {
   }
   sendVolumeWhenReady();
   servicePresetResume();
+  if(millis()-lastA31ActivityAt>=800) maintainA98Subscriptions();
   if (WiFi.status() == WL_CONNECTED && !volumeDirty &&
       millis() - lastGroupPollAt >= (groupKnown && isSlave ? kSlavePollMs : kGroupPollMs))
     refreshGroupStatus();

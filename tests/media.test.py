@@ -14,6 +14,7 @@ code=r'''
 struct String:std::string{using std::string::string;String(const std::string&s):std::string(s){}String(){}bool isEmpty()const{return empty();}};
 enum class MenuScreen{Player,Zone};MenuScreen menuScreen=MenuScreen::Player;
 const int WL_CONNECTED=1,TFT_WHITE=65535,TFT_BLACK=0;int wifiState=1;struct Wifi{int status(){return wifiState;}} WiFi;
+uint32_t a98ArtworkEpoch=0;
 uint32_t now=10000,lastA31ActivityAt=0,lastArtAttemptAt=0,feedbackUntil=12000;uint32_t millis(){return now;}
 uint32_t marqueeStartedAt=0,marqueeLastAt=0,lastArtworkPollAt=0;int marqueeOffset=0;const uint32_t kArtworkPollMs=20000;
 String currentArtworkUrl="old",lastArtAttemptUrl,offeredUrl,fallbackUrl,reportedArtworkUrl,deviceIp="192.168.0.35",trackTitle="old song",trackArtist="old artist",currentMediaUri="old URI";

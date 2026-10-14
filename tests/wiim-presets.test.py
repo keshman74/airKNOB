@@ -10,7 +10,7 @@ a=s.index('String decodeXml(');b=s.index('\nbool request(const String& command, 
 xml=s[a:b]
 a=s.index('String cleanPresetName(');b=s.index('bool parseKeyPresets(',a)
 clean=s[a:b]
-a=s.index('bool isWiiMPresetChip()');b=s.index('bool readDevicePresets()',a)
+a=s.index('bool isWiiMPresetChip()');b=s.index('// A98 callback receiver',a)
 parser=s[a:b]
 a=s.index('  if(isWiiMPresetChip()) {',b);a=s.index('    StaticJsonDocument<256> filter;',a);b=s.index('\n  }',a)
 filtercode=s[a:b]
