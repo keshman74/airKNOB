@@ -50,7 +50,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.13";
+constexpr char kFirmwareVersion[] = "0.8.14";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -509,8 +509,38 @@ bool parseKeyPresets(const String& response) {
   }
   return true;
 }
+bool isWiiMPresetChip() {return activeEndpoint.chip==Chip::A97 || activeEndpoint.chip==Chip::A98;}
+bool sendWiiMPreset(int slot) {
+  if(!isWiiMPresetChip() || slot<1 || slot>12) return false;
+  String body;return request("MCUKeyShortClick:"+String(slot),body);
+}
+bool parseWiiMPresets(JsonVariantConst doc) {
+  devicePresetCount=0;
+  if(!doc["preset_list"].is<JsonArrayConst>()) return false;
+  for(JsonObjectConst item:doc["preset_list"].as<JsonArrayConst>()) {
+    if(!item["number"].is<int>() || !item["name"].is<const char*>()) continue;
+    const int slot=item["number"].as<int>();
+    const String name=cleanPresetName(item["name"].as<String>());
+    if(slot<1 || slot>12 || name.isEmpty()) continue;
+    bool duplicate=false;
+    for(int i=0;i<devicePresetCount;++i) if(devicePresets[i].slot==slot) duplicate=true;
+    if(duplicate || devicePresetCount>=12) continue;
+    devicePresets[devicePresetCount].slot=slot;devicePresets[devicePresetCount++].name=name;
+  }
+  for(int i=0;i<devicePresetCount;++i) for(int j=i+1;j<devicePresetCount;++j)
+    if(devicePresets[j].slot<devicePresets[i].slot) std::swap(devicePresets[i],devicePresets[j]);
+  return true;
+}
 bool readDevicePresets() {
   devicePresetCount=0;presetZone=deviceIp;
+  if(isWiiMPresetChip()) {
+    String body;if(!request("getPresetInfo",body)) return false;
+    StaticJsonDocument<256> filter;
+    filter["preset_list"][0]["number"]=true;filter["preset_list"][0]["name"]=true;
+    DynamicJsonDocument doc(4096);
+    if(deserializeJson(doc,body,DeserializationOption::Filter(filter))) return false;
+    return parseWiiMPresets(doc.as<JsonVariantConst>());
+  }
   if(isCloud()) {
     String body;if(!request("getPresetListInfo",body)) return false;
     StaticJsonDocument<256> filter;
@@ -643,7 +673,7 @@ bool downloadAndDecodeArtOriginal(String url) {
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
-    http.addHeader("User-Agent","airControl-KNOB/0.8.13");
+    http.addHeader("User-Agent","airControl-KNOB/0.8.14");
     http.addHeader("Accept","image/*,*/*;q=0.8");
     http.addHeader("Accept-Encoding","identity");
     const int status = http.GET();
@@ -2373,7 +2403,7 @@ void chooseMenuItem() {
         if(presetZone!=deviceIp || selectedItem<0 || selectedItem>=devicePresetCount) {menuMessage="REFRESH PRESETS";break;}
         presetResume.cancel();
         const int slot=devicePresets[selectedItem].slot;
-        if(!isCloud() && slot>10) {menuMessage="SLOT NOT VERIFIED";break;}
+        if(slot<1 || slot>(isCloud() || isWiiMPresetChip() ? 12 : 10)) {menuMessage="SLOT NOT VERIFIED";break;}
         // Refresh immediately before acting: a phone may have changed the group.
         if (!refreshGroupStatus()) { menuMessage = "CHECK ZONE"; break; }
         if (isSlave) { menuMessage = "SLAVE: NO PRESET"; break; }
@@ -2388,6 +2418,8 @@ void chooseMenuItem() {
           unconfirmed=result==PresetSelection::Unconfirmed;
           Serial.printf("A33 preset %d HTTP=%d bytes=%u result=%s\n",slot,status,unsigned(body.length()),
               unconfirmed?"unconfirmed":sent?"accepted":"rejected");
+        } else if(isWiiMPresetChip()) {
+          sent=sendWiiMPreset(slot);
         } else sent=mcuCommand(command) || request("MCUKeyShortClick:"+String(slot),body);
         if (sent) {
         if(isCloud() && !unconfirmed) {presetResumeZone=deviceIp;presetResume.schedule(millis());}
@@ -2821,7 +2853,7 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.13: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.14: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
