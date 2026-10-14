@@ -663,7 +663,7 @@ void maintainA98Subscriptions() {
     const int status=http.sendRequest("SUBSCRIBE");
     if(status==200 && http.header("SID").length()) {
       const String sid=http.header("SID");if(sid!=sub.sid) sub.hasSeq=false;sub.sid=sid;
-      String timeout=http.header("TIMEOUT");int seconds=timeout.substring(timeout.indexOf('-')+1).toInt();if(seconds<30)seconds=600;seconds=min(seconds,3600);
+      String timeout=http.header("TIMEOUT");int seconds=timeout.substring(timeout.indexOf('-')+1).toInt();if(seconds<1)seconds=600;seconds=min(seconds,3600);
       sub.due=millis()+uint32_t(seconds)*500;
     } else {sub.sid="";sub.hasSeq=false;sub.due=millis()+30000;}
     http.end();lastA31ActivityAt=millis();return;

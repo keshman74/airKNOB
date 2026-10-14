@@ -1,3 +1,6 @@
+#include <string>
+#include <array>
+#define local static
 #include "a98_presets.h"
 #include <cassert>
 #include <iostream>
