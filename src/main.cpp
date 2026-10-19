@@ -51,7 +51,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.15";
+constexpr char kFirmwareVersion[] = "0.8.16";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -104,44 +104,49 @@ class KnobDisplay : public lgfx::LGFX_Device {
   }
 };
 
-// Render normally to the LCD. For a screenshot, render the current state once
-// into a temporary RGB565 sprite; the panel itself has no readback wiring.
+// Render into a small reusable RGB565 band. The panel has no readback wiring;
+// screenshots regenerate the same scene one band at a time.
 class DisplayRouter {
   KnobDisplay lcd_;
   lgfx::LGFX_Sprite sprite_{&lcd_};
   bool capturing_ = false;
+  int captureTop_=0;
  public:
+  static constexpr int kCaptureRows=16;
   void init() { lcd_.init(); sprite_.setColorDepth(16); }
   void setBrightness(uint8_t level) { lcd_.setBrightness(level); }
-  bool beginCapture() {
-    if (!sprite_.createSprite(240, 240)) return false;
-    capturing_ = true;
+  bool beginCapture(int top=0) {
+    if (!sprite_.createSprite(240, kCaptureRows)) return false;
+    captureTop_=top;capturing_ = true;
     return true;
   }
+  void setCaptureTop(int top) { captureTop_=top; }
+  int clipTop() const {return capturing_ ? captureTop_ : 0;}
+  int clipBottom() const {return capturing_ ? captureTop_+kCaptureRows : 240;}
   bool isCapturing() const { return capturing_; }
-  void presentCapture() { if (capturing_) sprite_.pushSprite(0, 0); }
+  void presentCapture() { if (capturing_) sprite_.pushSprite(0, captureTop_); }
   void endCapture() { capturing_ = false; sprite_.deleteSprite(); }
-  uint16_t capturePixel(int x, int y) { return sprite_.readPixel(x, y); }
+  uint16_t capturePixel(int x, int y) { return sprite_.readPixel(x, y-captureTop_); }
   uint16_t color565(uint8_t r, uint8_t g, uint8_t b) {
     return lcd_.color565(r, g, b);
   }
   template<typename C> void fillScreen(C c) { if (capturing_) sprite_.fillScreen(c); else lcd_.fillScreen(c); }
   template<typename C> void fillRect(int x, int y, int w, int h, C c) {
-    if (capturing_) sprite_.fillRect(x,y,w,h,c); else lcd_.fillRect(x,y,w,h,c);
+    if (capturing_) sprite_.fillRect(x,y-captureTop_,w,h,c); else lcd_.fillRect(x,y,w,h,c);
   }
   template<typename C> void fillRoundRect(int x, int y, int w, int h, int r, C c) {
-    if (capturing_) sprite_.fillRoundRect(x,y,w,h,r,c);
+    if (capturing_) sprite_.fillRoundRect(x,y-captureTop_,w,h,r,c);
     else lcd_.fillRoundRect(x,y,w,h,r,c);
   }
   template<typename C> void fillCircle(int x, int y, int r, C c) {
-    if (capturing_) sprite_.fillCircle(x,y,r,c); else lcd_.fillCircle(x,y,r,c);
+    if (capturing_) sprite_.fillCircle(x,y-captureTop_,r,c); else lcd_.fillCircle(x,y,r,c);
   }
   template<typename C> void drawLine(int x1, int y1, int x2, int y2, C c) {
-    if (capturing_) sprite_.drawLine(x1,y1,x2,y2,c);
+    if (capturing_) sprite_.drawLine(x1,y1-captureTop_,x2,y2-captureTop_,c);
     else lcd_.drawLine(x1,y1,x2,y2,c);
   }
   template<typename C> void drawPixel(int x, int y, C c) {
-    if (capturing_) sprite_.drawPixel(x,y,c); else lcd_.drawPixel(x,y,c);
+    if (capturing_) sprite_.drawPixel(x,y-captureTop_,c); else lcd_.drawPixel(x,y,c);
   }
   void startWrite() { if (capturing_) sprite_.startWrite(); else lcd_.startWrite(); }
   void endWrite() { if (capturing_) sprite_.endWrite(); else lcd_.endWrite(); }
@@ -159,7 +164,7 @@ class DisplayRouter {
     if (capturing_) sprite_.setSwapBytes(swap); else lcd_.setSwapBytes(swap);
   }
   void pushImage(int x, int y, int w, int h, const uint16_t* pixels) {
-    if (capturing_) sprite_.pushImage(x,y,w,h,pixels);
+    if (capturing_) sprite_.pushImage(x,y-captureTop_,w,h,pixels);
     else lcd_.pushImage(x,y,w,h,pixels);
   }
 };
@@ -813,7 +818,7 @@ bool downloadAndDecodeArtOriginal(String url) {
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
-    http.addHeader("User-Agent","airControl-KNOB/0.8.15");
+    http.addHeader("User-Agent","airControl-KNOB/0.8.16");
     http.addHeader("Accept","image/*,*/*;q=0.8");
     http.addHeader("Accept-Encoding","identity");
     const int status = http.GET();
@@ -1219,7 +1224,7 @@ void drawVolumeArc() {
   constexpr float r = 112.0f, half = 5.0f;
   const float end = 220.0f * volume / 100.0f;
   display.startWrite();
-  for (int y = 2; y < 239; ++y) {
+  for (int y = max(2,display.clipTop()); y < min(239,display.clipBottom()); ++y) {
     int runStart = -1; uint16_t runColor = 0;
     for (int x = 2; x <= 239; ++x) {
       const float dx = x - 120.0f, dy = y - 120.0f;
@@ -1531,8 +1536,9 @@ void drawScanScreen() {
 void drawScreen() {
   if (menuScreen == MenuScreen::Player && !display.isCapturing()) {
     if (display.beginCapture()) {
-      drawScreen();
-      display.presentCapture();
+      for(int top=0;top<240;top+=DisplayRouter::kCaptureRows) {
+        display.setCaptureTop(top);drawScreen();display.presentCapture();
+      }
       display.endCapture();
       return;
     }
@@ -1607,16 +1613,13 @@ void handleScreenshot() {
     client.stop();
     return;
   }
-  // 115200 contiguous bytes are needed. PNG/JPEG downloads have already freed
-  // their temporary buffers by the time the main loop serves this request.
-  if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 116000 ||
-      !display.beginCapture()) {
+  // Only 240*16*2 = 7680 bytes, instead of a 115200-byte full framebuffer.
+  if (!display.beginCapture(240-DisplayRouter::kCaptureRows)) {
     client.print("HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n"
                  "Content-Length: 19\r\nConnection: close\r\n\r\nNot enough free RAM");
     client.stop();
     return;
   }
-  drawScreen();
   constexpr uint32_t bytes = 54 + 240 * 240 * 3;
   uint8_t header[54] = {};
   header[0] = 'B'; header[1] = 'M';
@@ -1634,15 +1637,19 @@ void handleScreenshot() {
                "Content-Length: 172854\r\nConnection: close\r\n\r\n");
   client.write(header, sizeof(header));
   uint8_t row[240 * 3];
-  for (int y = 239; y >= 0 && client.connected(); --y) {
-    for (int x = 0; x < 240; ++x) {
-      const uint16_t rgb = display.capturePixel(x, y);
-      row[x*3]   = uint8_t((rgb & 31) * 255 / 31);
-      row[x*3+1] = uint8_t(((rgb >> 5) & 63) * 255 / 63);
-      row[x*3+2] = uint8_t(((rgb >> 11) & 31) * 255 / 31);
+  bool writing=true;
+  for(int top=240-DisplayRouter::kCaptureRows;top>=0 && writing && client.connected();top-=DisplayRouter::kCaptureRows) {
+    display.setCaptureTop(top);drawScreen();
+    for(int y=top+DisplayRouter::kCaptureRows-1;y>=top && client.connected();--y) {
+      for (int x = 0; x < 240; ++x) {
+        const uint16_t rgb = display.capturePixel(x, y);
+        row[x*3]   = uint8_t((rgb & 31) * 255 / 31);
+        row[x*3+1] = uint8_t(((rgb >> 5) & 63) * 255 / 63);
+        row[x*3+2] = uint8_t(((rgb >> 11) & 31) * 255 / 31);
+      }
+      if (client.write(row, sizeof(row)) != sizeof(row)) {writing=false;break;}
+      delay(0);
     }
-    if (client.write(row, sizeof(row)) != sizeof(row)) break;
-    delay(0);
   }
   display.endCapture();
   client.stop();
@@ -1803,6 +1810,15 @@ void startSettingsWeb() {
   const char* otaHeaders[] = {"X-Firmware-Size"};
   settingsServer.collectHeaders(otaHeaders, 1);
   settingsServer.on("/", HTTP_GET, []() { webPage(); });
+  settingsServer.on("/health",HTTP_GET,[](){
+    StaticJsonDocument<512> doc;
+    doc["firmware"]=kFirmwareVersion;doc["uptime_s"]=millis()/1000;
+    doc["free_heap"]=ESP.getFreeHeap();doc["min_free_heap"]=ESP.getMinFreeHeap();
+    doc["largest_free_block"]=heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+    doc["psram_total"]=ESP.getPsramSize();doc["psram_free"]=ESP.getFreePsram();
+    doc["capture_buffer_bytes"]=240*DisplayRouter::kCaptureRows*2;
+    String body;serializeJson(doc,body);settingsServer.send(200,"application/json",body);
+  });
   settingsServer.on("/zones", HTTP_GET, []() {
     DynamicJsonDocument doc(8192);
     doc["scanning"] = bool(scanPhase || webScanRequested);
@@ -2997,7 +3013,7 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.15: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.16: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
