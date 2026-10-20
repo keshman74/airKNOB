@@ -41,6 +41,39 @@ int main(){
  std::cout<<"Actual WiiM JSON parser/filter: sparse original IDs, sorted slots11/12, Cyrillic, duplicates, malformed/empty/type rejection passed\n";
 }
 '''
+
+a=s.index('  if(isWiiMPresetChip()) {',s.index('bool readDevicePresets()'))
+b=s.index('\n  }',a)
+loader=s[a:b+4]
+code=code.replace('struct Endpoint{Chip chip=Chip::A31;}','struct Endpoint{Chip chip=Chip::A31;unsigned port=80;bool tls=false;}')
+helpers=r'''
+String deviceIp="192.168.0.97",offered;int presetReadHttp=0,presetReadBytes=0,offeredHttp=200,reads=0;
+unsigned lastPort=0,lastA31ActivityAt=0;bool lastTLS=false,receiveOK=true;
+uint32_t millis(){return 1234;}
+bool readEndpoint(const String& ip,const Endpoint& endpoint,const String& command,String& body,uint32_t timeout,int* status){
+ assert(ip==deviceIp&&command=="getPresetInfo"&&timeout==1200);++reads;lastPort=endpoint.port;lastTLS=endpoint.tls;*status=offeredHttp;body=offered;return receiveOK;
+}
+bool loadFixture(){
+'''+loader+r'''
+return false;
+}
+'''
+cases=r'''
+ activeEndpoint.chip=Chip::A97;
+ for(bool tls:{false,true}){
+  activeEndpoint.tls=tls;activeEndpoint.port=tls?443:80;receiveOK=true;offeredHttp=200;
+  offered=R"({"preset_list":[{"number":12,"name":"Twelve"},{"number":3,"name":"Люкс FM"}]})";
+  assert(loadFixture()&&lastTLS==tls&&lastPort==(tls?443:80)&&lastA31ActivityAt==1234);
+  assert(presetReadHttp==200&&presetReadBytes==int(offered.length())&&presetReadError.empty());
+  assert(devicePresetCount==2&&devicePresets[0].slot==3&&devicePresets[1].slot==12);
+ }
+ receiveOK=false;offeredHttp=-1;offered="";assert(!loadFixture()&&presetReadHttp==-1&&presetReadBytes==0&&presetReadError=="http_or_body");
+ receiveOK=true;offeredHttp=200;offered="broken";assert(!loadFixture()&&presetReadError=="json_parse");
+ offered=R"({"preset_list":{}})";assert(!loadFixture()&&presetReadError=="json_structure");
+ offered=R"({"preset_list":[]})";assert(loadFixture()&&devicePresetCount==0&&presetReadError.empty());
+'''
+code=code.replace('int main(){',helpers+'int main(){'+cases,1)
+
 Path('/tmp/knob_wiim_presets.cpp').write_text(code)
 subprocess.run(['g++','-std=c++11','-I'+include,'/tmp/knob_wiim_presets.cpp','-o','/tmp/knob_wiim_presets'],check=True)
 subprocess.run(['/tmp/knob_wiim_presets'],check=True)

@@ -54,7 +54,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.19";
+constexpr char kFirmwareVersion[] = "0.8.20";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -448,9 +448,9 @@ int devicePresetCount=0;
 String presetZone;
 int presetReadHttp=0;size_t presetReadBytes=0;
 String presetReadError="not_requested";
-bool a98PresetReadPending=false;
-uint32_t a98PresetReadEpoch=0;
-String a98PresetReadIp;
+bool wiimPresetReadPending=false;
+uint32_t wiimPresetReadEpoch=0;
+String wiimPresetReadIp;
 int selectedPreset = 1;
 String trackTitle;
 String trackArtist;
@@ -765,12 +765,14 @@ bool readDevicePresets() {
   presetReadHttp=0;presetReadBytes=0;presetReadError="read_failed";
   if(activeEndpoint.chip==Chip::A98) return readA98Presets();
   if(isWiiMPresetChip()) {
-    String body;if(!request("getPresetInfo",body)) return false;
-    presetReadHttp=200;presetReadBytes=body.length();
+    String body;
+    const bool received=readEndpoint(deviceIp,activeEndpoint,"getPresetInfo",body,1200,&presetReadHttp);
+    lastA31ActivityAt=millis();presetReadBytes=body.length();
+    if(!received) {presetReadError="http_or_body";return false;}
     StaticJsonDocument<256> filter;
     filter["preset_list"][0]["number"]=true;filter["preset_list"][0]["name"]=true;
     DynamicJsonDocument doc(4096);
-    if(deserializeJson(doc,body,DeserializationOption::Filter(filter))) return false;
+    if(deserializeJson(doc,body,DeserializationOption::Filter(filter))) {presetReadError="json_parse";return false;}
     const bool parsed=parseWiiMPresets(doc.as<JsonVariantConst>());
     presetReadError=parsed?"":"json_structure";return parsed;
   }
@@ -859,7 +861,7 @@ bool downloadAndDecodeArtOriginal(String url) {
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
-    http.addHeader("User-Agent","airControl-KNOB/0.8.19");
+    http.addHeader("User-Agent","airControl-KNOB/0.8.20");
     http.addHeader("Accept","image/*,*/*;q=0.8");
     http.addHeader("Accept-Encoding","identity");
     const int status = http.GET();
@@ -1927,7 +1929,8 @@ void startSettingsWeb() {
     doc["preset_http"]=presetReadHttp;doc["preset_bytes"]=presetReadBytes;doc["preset_error"]=presetReadError;
     doc["firmware"]=kFirmwareVersion;doc["uptime_s"]=millis()/1000;
     doc["reset_reason"]=int(esp_reset_reason());
-    doc["a98_presets_pending"]=a98PresetReadPending;
+    doc["wiim_presets_pending"]=wiimPresetReadPending;
+    doc["a98_presets_pending"]=activeEndpoint.chip==Chip::A98 && wiimPresetReadPending;
     doc["loop_stack_watermark_raw"]=uxTaskGetStackHighWaterMark(nullptr);
     doc["worker_stack_watermark_raw"]=backgroundPollTask?uxTaskGetStackHighWaterMark(backgroundPollTask):0;
     doc["free_heap"]=ESP.getFreeHeap();doc["min_free_heap"]=ESP.getMinFreeHeap();
@@ -2066,25 +2069,25 @@ void startSettingsWeb() {
   settingsServer.begin();
 }
 
-void requestA98PresetRefresh() {
-  if(activeEndpoint.chip!=Chip::A98) return;
-  a98PresetReadPending=true;a98PresetReadEpoch=zoneEpoch;a98PresetReadIp=deviceIp;
+void requestWiiMPresetRefresh() {
+  if(!isWiiMPresetChip()) return;
+  wiimPresetReadPending=true;wiimPresetReadEpoch=zoneEpoch;wiimPresetReadIp=deviceIp;
   artworkCancel.store(true);
   if(presetZone!=deviceIp) devicePresetCount=0;
   menuMessage="READING";drawMenu();
 }
-void serviceA98PresetRefresh() {
-  if(!a98PresetReadPending) return;
-  if(menuScreen!=MenuScreen::Presets || a98PresetReadEpoch!=zoneEpoch ||
-     a98PresetReadIp!=deviceIp || activeEndpoint.chip!=Chip::A98) {
-    a98PresetReadPending=false;return;
+void serviceWiiMPresetRefresh() {
+  if(!wiimPresetReadPending) return;
+  if(menuScreen!=MenuScreen::Presets || wiimPresetReadEpoch!=zoneEpoch ||
+     wiimPresetReadIp!=deviceIp || !isWiiMPresetChip()) {
+    wiimPresetReadPending=false;return;
   }
   if(otaActive || rebootAfterResponse || scanPhase || localVolumePending() || backgroundPollBusy()) return;
   // Run after the button call stack has unwound, and only after the worker
   // response has been drained. No second player/TLS request runs in parallel.
   const bool ok=readDevicePresets();
-  lastA31ActivityAt=millis();if(!ok) a98MetadataRetry=millis()+30000;
-  a98PresetReadPending=false;selectedItem=0;
+  lastA31ActivityAt=millis();if(!ok && activeEndpoint.chip==Chip::A98) a98MetadataRetry=millis()+30000;
+  wiimPresetReadPending=false;selectedItem=0;
   menuMessage=ok?(devicePresetCount?"":"NO PRESETS"):"READ FAILED";
   drawMenu();
 }
@@ -2101,7 +2104,7 @@ void setMenu(MenuScreen screen) {
   marqueeOffset = 0;
   drawScreen();
   if(screen==MenuScreen::Presets) {
-    if(activeEndpoint.chip==Chip::A98) {requestA98PresetRefresh();return;}
+    if(isWiiMPresetChip()) {requestWiiMPresetRefresh();return;}
     menuMessage="READING";drawMenu();
     const bool ok=readDevicePresets();
     selectedItem=0;menuMessage=ok ? (devicePresetCount ? "" : "NO PRESETS") : "READ FAILED";
@@ -2710,9 +2713,9 @@ void chooseMenuItem() {
     }
     case MenuScreen::Presets:
       {
-        if(a98PresetReadPending) {menuMessage="READING";drawMenu();return;}
+        if(wiimPresetReadPending) {menuMessage="READING";drawMenu();return;}
         if(selectedItem==devicePresetCount) {
-          if(activeEndpoint.chip==Chip::A98) {requestA98PresetRefresh();return;}
+          if(isWiiMPresetChip()) {requestWiiMPresetRefresh();return;}
           menuMessage="READING";drawMenu();
           const bool ok=readDevicePresets();selectedItem=0;
           menuMessage=ok ? (devicePresetCount ? "" : "NO PRESETS") : "READ FAILED";
@@ -3143,13 +3146,13 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.19: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.20: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
 
 void loop() {
-  if(!otaActive && !rebootAfterResponse) {pollEncoder();pollButton();sendVolumeWhenReady();serviceBackgroundPoll();serviceA98PresetRefresh();}
+  if(!otaActive && !rebootAfterResponse) {pollEncoder();pollButton();sendVolumeWhenReady();serviceBackgroundPoll();serviceWiiMPresetRefresh();}
   if (WiFi.status() == WL_CONNECTED) {pollA98Events();settingsServer.handleClient();}
   if (rebootAfterResponse) { delay(500); ESP.restart(); }
   if (otaActive) { delay(1); return; }
@@ -3196,9 +3199,9 @@ void loop() {
   }
   sendVolumeWhenReady();
   servicePresetResume();
-  if(!a98PresetReadPending && !backgroundPollBusy() && millis()-lastInteractionAt>=800 && millis()-lastA31ActivityAt>=800) maintainA98Subscriptions();
+  if(!wiimPresetReadPending && !backgroundPollBusy() && millis()-lastInteractionAt>=800 && millis()-lastA31ActivityAt>=800) maintainA98Subscriptions();
   const bool quiet=!localVolumePending() && millis()-lastInteractionAt>=800 && millis()-lastA31ActivityAt>=800;
-  if(WiFi.status()==WL_CONNECTED && quiet && !a98PresetReadPending && !backgroundPollBusy()) {
+  if(WiFi.status()==WL_CONNECTED && quiet && !wiimPresetReadPending && !backgroundPollBusy()) {
     const uint32_t statusInterval=a31Tcp.connected()?kPollIntervalMs:kFallbackPollIntervalMs;
     if(activeEndpoint.chip==Chip::Unknown) {
       if(millis()-lastPollAt>=kFallbackPollIntervalMs) {lastPollAt=millis();pollDevice();}
