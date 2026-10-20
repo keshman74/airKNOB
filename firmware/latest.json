@@ -1,7 +1,7 @@
 {
-  "version": "0.8.21",
+  "version": "0.8.22",
   "board": "onx2424g013",
-  "size": 1344976,
-  "md5": "afbe7a1cab3cffcfe4632b25e28986e9",
-  "url": "https://raw.githubusercontent.com/keshman74/airKNOB/main/firmware/airControl-KNOB-v0.8.21.bin"
+  "size": 1348464,
+  "md5": "185eac7b006d2f15700770641e8039b2",
+  "url": "https://raw.githubusercontent.com/keshman74/airKNOB/main/firmware/airControl-KNOB-v0.8.22.bin"
 }
