@@ -17,6 +17,7 @@
 #include "a98_presets.h"
 #include <JPEGDEC.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
 #include <atomic>
 #include <lwip/sockets.h>
 #include <fcntl.h>
@@ -53,7 +54,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.17";
+constexpr char kFirmwareVersion[] = "0.8.18";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -589,8 +590,10 @@ bool parseKeyPresets(const String& response) {
   context=xmlValue(context,"KeyList");
   if(!context.length()) return false;
   int maximum=xmlValue(context,"MaxNumber").toInt();
-  if(maximum<1 || maximum>20) return false;
-  for(int slot=1;slot<=maximum;++slot) {
+  // MaxNumber describes the device key-map structure, not our array capacity.
+  // A31 hardware readback includes MaxNumber=21 and reserved/empty Key0/Key21.
+  if(maximum<1 || maximum>64) return false;
+  for(int slot=1;slot<=std::min(maximum,20);++slot) {
     char key[8];snprintf(key,sizeof(key),"Key%d",slot);
     const String entry=decodeXml(xmlValue(context,key));
     const String name=cleanPresetName(xmlValue(entry,"Name"));
@@ -851,7 +854,7 @@ bool downloadAndDecodeArtOriginal(String url) {
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
-    http.addHeader("User-Agent","airControl-KNOB/0.8.17");
+    http.addHeader("User-Agent","airControl-KNOB/0.8.18");
     http.addHeader("Accept","image/*,*/*;q=0.8");
     http.addHeader("Accept-Encoding","identity");
     const int status = http.GET();
@@ -1918,6 +1921,9 @@ void startSettingsWeb() {
     doc["zone_ip"]=deviceIp;doc["zone_chip"]=chipName(activeEndpoint.chip);
     doc["preset_http"]=presetReadHttp;doc["preset_bytes"]=presetReadBytes;doc["preset_error"]=presetReadError;
     doc["firmware"]=kFirmwareVersion;doc["uptime_s"]=millis()/1000;
+    doc["reset_reason"]=int(esp_reset_reason());
+    doc["loop_stack_watermark_raw"]=uxTaskGetStackHighWaterMark(nullptr);
+    doc["worker_stack_watermark_raw"]=backgroundPollTask?uxTaskGetStackHighWaterMark(backgroundPollTask):0;
     doc["free_heap"]=ESP.getFreeHeap();doc["min_free_heap"]=ESP.getMinFreeHeap();
     doc["largest_free_block"]=heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
     doc["psram_total"]=ESP.getPsramSize();doc["psram_free"]=ESP.getFreePsram();
@@ -3105,7 +3111,7 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.17: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.18: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
