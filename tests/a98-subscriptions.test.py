@@ -1,6 +1,6 @@
 from pathlib import Path
 import subprocess
-s=Path('src/main.cpp').read_text();a=s.index('void maintainA98Subscriptions()');b=s.index('bool readDevicePresets()',a)
+s=Path('src/main.cpp').read_text();a=s.index('void maintainA98Subscriptions()');b=s.index('bool readKeyMappingPresets(',a)
 mock=Path('tests/xml-media.test.py').read_text().split("code=r'''",1)[1].split("'''+s[a:b]",1)[0]
 mock=mock.replace(' int indexOf(char c',' String(unsigned n):std::string(std::to_string(n)){}\n String(int n):std::string(std::to_string(n)){}\n int toInt()const{try{return std::stoi(*this);}catch(...){return 0;}}\n bool isEmpty()const{return empty();}\n int indexOf(char c')
 code=mock+r'''
