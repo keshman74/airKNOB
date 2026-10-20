@@ -1,0 +1,15 @@
+# v0.8.6 media presentation and partial-state handling
+
+User report: Play/Pause feedback covers/cuts album artwork. A31 station cover works; A97/A98 cover alternates present/absent; A33 cover and playback state are intermittent. Image attachment was unavailable locally; no visual conclusions are based on it.
+
+Compared current airControl src/main.jsx parseStatus and metadata resolver, and electron/main.cjs artwork/UPnP path. Concrete old KNOB faults: empty artwork URL immediately discarded a good bitmap; title mismatch discarded artwork; getMetaInfo overwrote the title supplied by getPlayerStatus, producing alternating identities; failed decoder modified the live pixel buffer; A33 empty PlayState became false, and the valid "plays" alias was not recognized.
+
+Changes: feedback confined to the header above y=62 cover start; two-second duration retained. Decoder writes a separate 76x76 staging buffer; live bitmap copied only after complete payload and successful decoding. Empty/failed artwork samples retain last successfully decoded image. Successful URL committed only on success; failed URL is retryable, with five-second same-URL cooldown. Artwork-only reads do not modify transport title/artist. Empty metadata samples do not erase known strings; title/ICY changes do not clear the visible bitmap. Explicit zone/source/preset reset behavior is retained.
+
+A97/A98 use getMetaInfo first, existing read-only UPnP fallback if absent or download fails. SOAP metadata parser now handles namespace tags, embedded DIDL/CDATA, and TrackMetaData/CurrentTrackMetaData/AVTransportURIMetaData with XML entity decoding. Existing :49152 Linkplay endpoint retained; no claim of universal endpoint discovery added here.
+
+A33 merges nonempty AllMate/AltMate fields. Playback priority: root PlayState, AllMate PlayState, AltMate PlayState, optional getPlayerStatus.PlayStatus/status; unknown/absent retains previous state. Recognizes plays/play/playing/1 and pause/paused/stop/stopped/0, normalizing case and whitespace. Optional fallback failure does not mark a valid getStatusEx device offline. Artwork uses TrackImage; optional getMetaInfo fallback accepts HTTP/HTTPS artwork only. A33 gmrender SOAP metadata is not used for main playback because it is an independent renderer. Desktop's persisted station/favicon recovery is application-local and is not available to KNOB; if the device exposes no image URL, a first cover cannot be invented.
+
+Image HTTP requests ask for HTTP/1.0 and identity encoding to avoid feeding HTTP chunk framing/compression into image decoders. Use declared payload size when available instead of a fixed 96KiB allocation; validate complete length. Allocation/unsupported-format/decode failures retain old cover. No filesystem formatting or external proxy added.
+
+Hardware status: implemented and host-tested, still requires A97/A98/A33 validation. Tests extract actual artwork poll and header drawing code to cover empty/failed sample retention, retry, URL commit, playback aliases/unknown values and cover-coordinate bounds. Confirmed discovery v0.8.5 remains unchanged; retained discovery/encoder/OTA tests run in CI.

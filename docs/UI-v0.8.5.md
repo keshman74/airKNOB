@@ -1,0 +1,13 @@
+# v0.8.5 asynchronous progressive discovery
+
+Hardware report: v0.8.4 still intermittently misses zones, desktop airControl finds quickly. Compared current desktop electron/main.cjs (progressive SSDP + up to 96 parallel addresses, API timeout 600ms) with KNOB serial blocking scanner. This implementation is not hardware-verified yet.
+
+Main loop now only drains SSDP replies, LOCATION candidates, multicast NOTIFY and A33 UDP 53308 into a bounded queue. One FreeRTOS task performs API validation; up to four nonblocking TCP connections test 80/443/8000/8443. Probe sockets are closed before HTTP/TLS validation, limiting live sockets/heap. Main loop owns all UI and zone state; only POD job/results cross queues. Scan generations reject stale results after cancellation/restart. Worker sleeps on a task notification when idle. Background cover/status polling is paused during scans; explicit volume/button control remains available.
+
+Found devices appear immediately in menu/web and can be selected before the sweep finishes. Selection cancels remaining work; an in-flight GET may finish before worker observes cancellation. Web has Stop search, long press cancels panel search. Failed candidates may retry once, then are bounded for the scan; successful candidates are deduplicated. Three spaced SSDP bursts, temporary NOTIFY and UDP listeners remain active throughout the scan. Known IP cache seeds the next scan; completion/cancel saves only verified addresses. Network scan is still the current IPv4 /24, additionally subnet filtered. Overall worker deadline is 60 seconds plus at most an in-flight request; this is not a claim of desktop-equivalent completion speed on ESP32.
+
+API profile detection accepts recognizable A31/A97/A98/A33. A response with uuid and Linkplay identity fields at /httpapi.asp is retained as LINKPLAY if the exact hardware label is unknown; generic HTTP/HTTPS controls are available, A31-specific TCP/DSP are not assumed. All candidates still pass actual API validation.
+
+Tests: actual endpoint detector including stale generation and generic profile; SSDP LOCATION parser; scheduler duplicate suppression/retry cap/restart/timer wrap/full subnet; progressive web selection and stop control; existing encoder, OTA and versioned artifact tests retained. Stable main channel unchanged; experimental versioned firmware published.
+
+Actual worker code was also compiled for host C++11 with deterministic socket/FreeRTOS mocks and tested in a background thread: main enqueue during delayed API, cancellation drops old-generation results, restart verifies again, exactly four maximum probe sockets and no leaked mock sockets. This checks concurrency logic, not ESP32 radio/socket timing. TLS worker stack increased to 12 KiB.

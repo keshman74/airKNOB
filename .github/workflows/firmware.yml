@@ -1,13 +1,13 @@
 name: Build and publish KNOB firmware
 on:
   push:
-    branches: [main]
-    paths: ['src/**', 'platformio.ini', '.github/workflows/firmware.yml', 'scripts/**']
+    branches: [main, experimental/multichip-v0.8.0]
+    paths: ['src/**', 'platformio.ini', '.github/workflows/firmware.yml', 'scripts/**', 'tests/**']
   workflow_dispatch:
 permissions:
   contents: write
 concurrency:
-  group: knob-firmware-main
+  group: knob-firmware-${{ github.ref_name }}
   cancel-in-progress: false
 jobs:
   firmware:
@@ -18,18 +18,43 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install platformio==6.1.18
+      - run: node tests/web-zones.test.cjs
+      - run: python3 tests/encoder.test.py
+      - run: g++ -std=c++17 -Isrc tests/bounded-http.test.cpp -o /tmp/bounded-http && /tmp/bounded-http
+      - run: g++ -std=c++17 -Isrc tests/volume-arc.test.cpp -o /tmp/volume-arc && /tmp/volume-arc
+      - run: python3 tests/discovery.test.py
+      - run: python3 tests/worker.test.py
+      - run: python3 tests/media.test.py
+      - run: python3 tests/capture-bands.test.py
+      - run: python3 tests/art-scale.test.py
+      - run: g++ -std=c++11 -Isrc tests/art-thumbnail.test.cpp -o /tmp/art-thumbnail && /tmp/art-thumbnail
+      - run: python3 tests/xml-media.test.py
+      - run: python3 tests/presets.test.py
+      - run: python3 tests/a98-notify.test.py
+      - run: python3 tests/a98-subscriptions.test.py
+      - run: g++ -std=c++11 -Isrc tests/a98-presets.test.cpp -o /tmp/a98-presets && /tmp/a98-presets
+      - run: python3 tests/preset-resume.test.py
+      - run: g++ -std=c++11 -Isrc tests/preset-selection.test.cpp -o /tmp/preset-selection && /tmp/preset-selection
+      - run: g++ -std=c++17 tests/scheduler.test.cpp -o /tmp/discovery-scheduler-test && /tmp/discovery-scheduler-test
+      - run: python3 tests/ssdp.test.py
+      - run: python3 tests/manifest.test.py
+      - run: node tests/upload.test.cjs
       - run: pio run
+      - run: python3 tests/wiim-presets.test.py
+      - run: python3 tests/a98-routines.test.py
+      - run: python3 tests/background-poll.test.py
+      - run: python3 tests/art-worker.test.py
       - run: python3 scripts/publish_manifest.py
       - uses: actions/upload-artifact@v4
         with:
           name: airControl-KNOB-firmware
           path: firmware/
-      - name: Publish firmware to main
+      - name: Publish firmware to current branch
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add firmware/
           if ! git diff --cached --quiet; then
             git commit -m "Publish firmware [skip ci]"
-            git push origin HEAD:main
+            git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
