@@ -16,7 +16,7 @@ a=s.index('  if(isWiiMPresetChip()) {',b);a=s.index('    StaticJsonDocument<256>
 filtercode=s[a:b]
 code=mock+r'''
 #include <ArduinoJson.h>
-String presetReadError;
+String presetReadError,presetReadSource;unsigned presetReadPort=0;
 void convertFromJson(JsonVariantConst source,String& target){target=source.as<const char*>() ? source.as<const char*>() : "";}
 bool canConvertFromJson(JsonVariantConst source,const String&){return source.is<const char*>();}
 enum class Chip{A31,A97,A98,A33};struct Endpoint{Chip chip=Chip::A31;}activeEndpoint;

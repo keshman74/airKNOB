@@ -54,7 +54,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.20";
+constexpr char kFirmwareVersion[] = "0.8.21";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -448,6 +448,8 @@ int devicePresetCount=0;
 String presetZone;
 int presetReadHttp=0;size_t presetReadBytes=0;
 String presetReadError="not_requested";
+String presetReadSource="not_requested";
+uint16_t presetReadPort=0;
 bool wiimPresetReadPending=false;
 uint32_t wiimPresetReadEpoch=0;
 String wiimPresetReadIp;
@@ -484,7 +486,7 @@ void resetSelectedZone() {
   masterIp=groupValue=trackTitle=trackArtist=currentMediaUri="";
   artworkReady=artworkAttempted=false;
   currentArtworkUrl=reportedArtworkUrl=lastArtAttemptUrl="";lastArtAttemptAt=0;
-  presetZone="";devicePresetCount=0;presetReadError="not_requested";
+  presetZone="";devicePresetCount=0;presetReadError="not_requested";presetReadSource="not_requested";presetReadPort=0;
   for(auto& preset:devicePresets) {preset.slot=0;preset.name="";}
   portENTER_CRITICAL(&encoderMux);encoderRead=encoderWrite;encoderAccumulator=0;portEXIT_CRITICAL(&encoderMux);
   lastPollAt=millis()-kPollIntervalMs;
@@ -586,7 +588,7 @@ String cleanPresetName(String name) {
   }
   name.trim();return name;
 }
-bool parseKeyPresets(const String& response) {
+bool parseKeyPresets(const String& response,int slotLimit=20) {
   devicePresetCount=0;
   String context=decodeXml(xmlValue(response,"QueueContext"));
   if(!context.length()) context=decodeXml(response);
@@ -595,8 +597,8 @@ bool parseKeyPresets(const String& response) {
   int maximum=xmlValue(context,"MaxNumber").toInt();
   // MaxNumber describes the device key-map structure, not our array capacity.
   // A31 hardware readback includes MaxNumber=21 and reserved/empty Key0/Key21.
-  if(maximum<1 || maximum>64) return false;
-  for(int slot=1;slot<=std::min(maximum,20);++slot) {
+  if(maximum<1 || maximum>64 || slotLimit<1 || slotLimit>20) return false;
+  for(int slot=1;slot<=std::min(maximum,slotLimit);++slot) {
     char key[8];snprintf(key,sizeof(key),"Key%d",slot);
     const String entry=decodeXml(xmlValue(context,key));
     const String name=cleanPresetName(xmlValue(entry,"Name"));
@@ -687,6 +689,7 @@ void pollA98Events() {
   if((!a98HeaderLength && a98EventLength>=2048) || a98EventLength>=sizeof(a98EventBuffer)-1 || millis()-a98ClientStarted>2000) a98EventClient.stop();
 }
 bool a98ReadKeyMapping(String& response) {
+  presetReadSource="playqueue";presetReadPort=59152;
   WiFiClient client;HTTPClient http;http.useHTTP10(true);http.setConnectTimeout(350);http.setTimeout(1200);
   if(!http.begin(client,"http://"+deviceIp+":59152/upnp/control/PlayQueue1")) return false;
   http.addHeader("Content-Type","text/xml; charset=utf-8");http.addHeader("SOAPAction","\"urn:schemas-wiimu-com:service:PlayQueue:1#GetKeyMapping\"");
@@ -760,11 +763,38 @@ void maintainA98Subscriptions() {
   }
 }
 
+bool readKeyMappingPresets(uint16_t port,int slotLimit=20) {
+  presetReadSource="playqueue";presetReadPort=port;
+  presetReadHttp=0;presetReadBytes=0;presetReadError="http_or_body";
+  WiFiClient client;HTTPClient http;http.useHTTP10(true);
+  http.setConnectTimeout(350);http.setTimeout(1200);
+  if(!http.begin(client,"http://"+deviceIp+":"+String(port)+"/upnp/control/PlayQueue1")) return false;
+  http.addHeader("Content-Type","text/xml; charset=utf-8");
+  http.addHeader("SOAPAction","\"urn:schemas-wiimu-com:service:PlayQueue:1#GetKeyMapping\"");
+  const String body="<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:GetKeyMapping xmlns:u=\"urn:schemas-wiimu-com:service:PlayQueue:1\"/></s:Body></s:Envelope>";
+  const int status=http.POST(body);
+  presetReadHttp=status;
+  String response;
+  const bool complete=status==200 && readBoundedResponse(http,response);
+  presetReadBytes=response.length();http.end();
+  if(!complete){presetReadError="http_or_body";return false;}
+  const bool parsed=parseKeyPresets(response,slotLimit);
+  presetReadError=parsed?"":"xml_structure";
+  return parsed;
+}
+
 bool readDevicePresets() {
   devicePresetCount=0;presetZone=deviceIp;
   presetReadHttp=0;presetReadBytes=0;presetReadError="read_failed";
   if(activeEndpoint.chip==Chip::A98) return readA98Presets();
+  if(activeEndpoint.chip==Chip::A97) {
+    // Hardware-confirmed A97 PlayQueue endpoints; commands remain on HTTPS.
+    if(readKeyMappingPresets(49152,12)) return true;
+    if(readKeyMappingPresets(59152,12)) return true;
+  }
   if(isWiiMPresetChip()) {
+    // Compatibility fallback for WiiM variants when PlayQueue is unavailable.
+    presetReadSource="getPresetInfo";presetReadPort=activeEndpoint.port;
     String body;
     const bool received=readEndpoint(deviceIp,activeEndpoint,"getPresetInfo",body,1200,&presetReadHttp);
     lastA31ActivityAt=millis();presetReadBytes=body.length();
@@ -777,6 +807,7 @@ bool readDevicePresets() {
     presetReadError=parsed?"":"json_structure";return parsed;
   }
   if(isCloud()) {
+    presetReadSource="getPresetListInfo";presetReadPort=activeEndpoint.port;
     String body;if(!request("getPresetListInfo",body)) return false;
     presetReadHttp=200;presetReadBytes=body.length();
     StaticJsonDocument<256> filter;
@@ -793,21 +824,7 @@ bool readDevicePresets() {
     }
     presetReadError="";return true;
   }
-  WiFiClient client;HTTPClient http;http.useHTTP10(true);
-  http.setConnectTimeout(350);http.setTimeout(1200);
-  if(!http.begin(client,"http://"+deviceIp+":49152/upnp/control/PlayQueue1")) return false;
-  http.addHeader("Content-Type","text/xml; charset=utf-8");
-  http.addHeader("SOAPAction","\"urn:schemas-wiimu-com:service:PlayQueue:1#GetKeyMapping\"");
-  const String body="<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:GetKeyMapping xmlns:u=\"urn:schemas-wiimu-com:service:PlayQueue:1\"/></s:Body></s:Envelope>";
-  const int status=http.POST(body);
-  presetReadHttp=status;
-  String response;
-  const bool complete=status==200 && readBoundedResponse(http,response);
-  presetReadBytes=response.length();http.end();
-  if(!complete){presetReadError="http_or_body";return false;}
-  const bool parsed=parseKeyPresets(response);
-  presetReadError=parsed?"":"xml_structure";
-  return parsed;
+  return readKeyMappingPresets(49152);
 }
 
 
@@ -861,7 +878,7 @@ bool downloadAndDecodeArtOriginal(String url) {
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
-    http.addHeader("User-Agent","airControl-KNOB/0.8.20");
+    http.addHeader("User-Agent","airControl-KNOB/0.8.21");
     http.addHeader("Accept","image/*,*/*;q=0.8");
     http.addHeader("Accept-Encoding","identity");
     const int status = http.GET();
@@ -1927,6 +1944,7 @@ void startSettingsWeb() {
     doc["background_poll"]=backgroundPoll.state.load();doc["background_job"]=backgroundPoll.artwork?"artwork":"status";doc["zone_epoch"]=zoneEpoch.load();
     doc["zone_ip"]=deviceIp;doc["zone_chip"]=chipName(activeEndpoint.chip);
     doc["preset_http"]=presetReadHttp;doc["preset_bytes"]=presetReadBytes;doc["preset_error"]=presetReadError;
+    doc["preset_source"]=presetReadSource;doc["preset_port"]=presetReadPort;
     doc["firmware"]=kFirmwareVersion;doc["uptime_s"]=millis()/1000;
     doc["reset_reason"]=int(esp_reset_reason());
     doc["wiim_presets_pending"]=wiimPresetReadPending;
@@ -3146,7 +3164,7 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.20: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.21: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }

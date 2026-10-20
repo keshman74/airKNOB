@@ -42,6 +42,7 @@ jobs:
       - run: node tests/upload.test.cjs
       - run: pio run
       - run: python3 tests/wiim-presets.test.py
+      - run: python3 tests/a97-playqueue.test.py
       - run: python3 tests/a98-routines.test.py
       - run: python3 tests/background-poll.test.py
       - run: python3 tests/art-worker.test.py
