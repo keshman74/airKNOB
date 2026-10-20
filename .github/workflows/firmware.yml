@@ -20,6 +20,8 @@ jobs:
       - run: pip install platformio==6.1.18
       - run: node tests/web-zones.test.cjs
       - run: python3 tests/encoder.test.py
+      - run: g++ -std=c++17 -Isrc tests/bounded-http.test.cpp -o /tmp/bounded-http && /tmp/bounded-http
+      - run: g++ -std=c++17 -Isrc tests/volume-arc.test.cpp -o /tmp/volume-arc && /tmp/volume-arc
       - run: python3 tests/discovery.test.py
       - run: python3 tests/worker.test.py
       - run: python3 tests/media.test.py
@@ -40,6 +42,8 @@ jobs:
       - run: pio run
       - run: python3 tests/wiim-presets.test.py
       - run: python3 tests/a98-routines.test.py
+      - run: python3 tests/background-poll.test.py
+      - run: python3 tests/art-worker.test.py
       - run: python3 scripts/publish_manifest.py
       - uses: actions/upload-artifact@v4
         with:

@@ -5,6 +5,7 @@ mock=Path('tests/xml-media.test.py').read_text().split("code=r'''",1)[1].split("
 mock=mock.replace(' int indexOf(char c',' bool isEmpty()const{return empty();}\n int indexOf(char c')
 code=mock+r'''
 #include <ArduinoJson.h>
+String presetReadError;
 #include "a98_presets.h"
 void convertFromJson(JsonVariantConst source,String& target){target=source.as<const char*>() ? source.as<const char*>() : "";}
 bool canConvertFromJson(JsonVariantConst source,const String&){return source.is<const char*>();}

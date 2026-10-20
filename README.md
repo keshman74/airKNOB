@@ -1,3 +1,13 @@
+# airControl KNOB v0.8.17 — experimental performance update
+
+Background artwork downloading and status polling keep the UI loop available for encoder input. Encoder events are applied in order and rendered once per batch. Old-zone and superseded-control responses are discarded. Volume arc geometry is cached in PSRAM when available; screenshot rendering retains the 7.5 KB strip buffer.
+
+HTTP response bodies are bounded and incomplete responses are rejected. A33 TCP reconnects reset partial event frames; explicit preset API errors are rejected without treating the documented `Not` selection response as failure. A98 canonical preset/input event matching is preserved.
+
+OTA file validation and error reporting are clearer. `/health` includes selected zone, preset-read diagnostics and background-job state. See [audit notes](docs/AUDIT-v0.8.17.md) for validation and remaining hardware checks.
+
+Install the versioned `.bin` via file upload. The stable online channel remains unchanged. This update needs hardware verification on A31/A33/A97/A98; host tests do not prove hardware compatibility.
+
 # airControl KNOB v0.8.0 — multi-chip test build
 
 A31 / A97 / A98 / A33 discovery and chip-aware adapters. Experimental branch: `experimental/multichip-v0.8.0`. Stable online channel remains main v0.7.3.

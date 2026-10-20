@@ -4,6 +4,7 @@
 #include <WiFiUdp.h>
 #include <WiFiManager.h>
 #include <HTTPClient.h>
+#include "bounded_http.h"
 #include <WebServer.h>
 #include <Preferences.h>
 #include <Update.h>
@@ -23,6 +24,7 @@
 #include <unistd.h>
 #include "discovery_scheduler.h"
 #include "media_state.h"
+#include "volume_arc.h"
 #include "utf8_mono_font.h"
 #include "sans_menu_font.h"
 
@@ -51,7 +53,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.16";
+constexpr char kFirmwareVersion[] = "0.8.17";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -178,10 +180,12 @@ String masterIp;
 String groupValue;
 bool groupKnown = false;
 uint32_t lastGroupPollAt = 0;
-bool rebootAfterResponse = false;
+std::atomic<bool> rebootAfterResponse{false};
 bool otaUploadFailed = false;
 bool otaUploadFinished = false;
-bool otaActive = false;
+String otaError;
+std::atomic<bool> otaActive{false};
+std::atomic<bool> artworkCancel{false};
 size_t otaExpectedBytes = 0, otaWrittenBytes = 0;
 uint32_t otaDrawAt = 0;
 int volume = kInitialVolume;
@@ -228,6 +232,7 @@ WiFiClient a31Tcp;
 String a31TcpIp;
 uint32_t lastTcpAttemptAt = 0;
 uint32_t lastTcpSentAt = 0;
+uint32_t tcpConnectionEpoch = 0;
 uint8_t tcpInput[2048];
 size_t tcpInputLength = 0;
 uint32_t pressedAt = 0;
@@ -251,6 +256,22 @@ bool mcuCommand(const String& payload, String* reply = nullptr);
 enum class Chip : uint8_t { Unknown, A31, A97, A98, A33, Linkplay };
 struct Endpoint { Chip chip = Chip::Unknown; uint16_t port = 80; bool tls = false; };
 Endpoint activeEndpoint;
+std::atomic<uint32_t> zoneEpoch{0};
+uint32_t controlEpoch=0;
+// One background read in flight. Only the worker owns its HTTP client; only
+// the UI task mutates device/UI state. Release/acquire publishes the snapshot.
+struct BackgroundPoll {
+  std::atomic<int> state{0}; // 0 idle, 1 requested, 2 running, 3 complete
+  String ip,command,body,extra,title,reported,currentUrl,lastAttempt;
+  Endpoint endpoint;
+  uint32_t epoch=0,control=0,artEpoch=0,elapsed=0;
+  bool group=false,ok=false,artwork=false,unchanged=false,hadArtwork=false;
+  uint32_t lastAttemptAt=0;
+};
+BackgroundPoll backgroundPoll;
+TaskHandle_t backgroundPollTask=nullptr;
+bool backgroundPollBusy(){return backgroundPoll.state.load()!=0;}
+
 struct ZoneInfo { String ip; String name; String uuid; Endpoint endpoint; };
 constexpr int kMaxZones = 20;
 ZoneInfo zones[kMaxZones];
@@ -278,9 +299,10 @@ bool isCloud() { return activeEndpoint.chip == Chip::A33; }
 void applyEndpoint(const Endpoint& endpoint) {
   if(a98Zone.length() && (a98Zone!=deviceIp || endpoint.chip!=Chip::A98)) resetA98State();
   presetResume.cancel();
+  ++zoneEpoch;artworkCancel.store(true);
   activeEndpoint = endpoint;
   graphicKnown = false;
-  a31Tcp.stop(); tcpInputLength = 0; lastTcpAttemptAt = 0; a31TcpIp = "";
+  a31Tcp.stop(); ++tcpConnectionEpoch; tcpInputLength = 0; lastTcpAttemptAt = lastTcpSentAt = 0; a31TcpIp = "";
   discoveredSourceCount = 0; sourceCapabilitiesKnown = false; reportedArtworkUrl = ""; currentMediaUri="";
   for (int i = 0; i < 3; ++i) toneKnown[i] = false;
   virtualBassKnown = false;
@@ -314,13 +336,16 @@ bool readEndpoint(const String& ip, const Endpoint& endpoint, const String& comm
   // Local players use self-signed TLS certificates, as in desktop airControl.
   if (endpoint.tls) { secure.setInsecure(); secure.setHandshakeTimeout(2); }
   HTTPClient http;
+  http.useHTTP10(true);
   http.setConnectTimeout(350); http.setTimeout(timeoutMs);
   const String path = endpoint.chip == Chip::A33 ? "/?Instruct=" : "/httpapi.asp?command=";
   const String url = String(endpoint.tls ? "https://" : "http://") + ip + ":" + String(endpoint.port) + path + encodeCommand(command);
   if (!(endpoint.tls ? http.begin(secure, url) : http.begin(plain, url))) return false;
   const int status = http.GET();
   if(responseStatus) *responseStatus=status;
-  response = status == 200 ? http.getString() : "";
+  response="";
+  const bool complete=status==200 && readBoundedResponse(http,response);
+  if(status==200 && !complete && responseStatus) *responseStatus=-11;
   http.end();
   if (endpoint.chip == Chip::A33) {
     String clean; clean.reserve(response.length());
@@ -330,7 +355,7 @@ bool readEndpoint(const String& ip, const Endpoint& endpoint, const String& comm
     if (clean.startsWith("\xEF\xBB\xBF")) clean.remove(0, 3);
     response = clean;
   }
-  return status == 200 && response.length() && response.indexOf("unknown comman") < 0;
+  return complete && response.length() && !(response.length()<128 && explicitApiRejection(std::string(response.c_str())));
 }
 bool looksLikeLinkplayStatus(JsonVariantConst info) {
   return !info["uuid"].isNull() && (!info["DeviceName"].isNull() || !info["project"].isNull() || !info["hardware"].isNull());
@@ -371,6 +396,40 @@ bool detectEndpoint(const String& ip, Endpoint& endpoint, String& statusBody,
   return false;
 }
 
+void runArtworkJob();
+void backgroundPollWorker(void*) {
+  for(;;) {
+    ulTaskNotifyTake(pdTRUE,portMAX_DELAY);
+    if(backgroundPoll.state.load()!=1) continue;
+    backgroundPoll.state.store(2);
+    const uint32_t started=millis();
+    backgroundPoll.extra="";
+    if(backgroundPoll.artwork) {runArtworkJob();backgroundPoll.elapsed=millis()-started;backgroundPoll.state.store(3);continue;}
+    backgroundPoll.ok=readEndpoint(backgroundPoll.ip,backgroundPoll.endpoint,
+                                  backgroundPoll.command,backgroundPoll.body,800);
+    if(backgroundPoll.ok && backgroundPoll.endpoint.chip==Chip::A33 && !backgroundPoll.group) {
+      DynamicJsonDocument doc(12288);
+      if(!deserializeJson(doc,backgroundPoll.body)) {
+        JsonVariant primary=doc["AllMate"];
+        JsonVariant metadata=primary.is<JsonObject>() && primary.size()>0?primary:doc["AltMate"].as<JsonVariant>();
+        String state=doc["PlayState"].as<String>();state.trim();state.toLowerCase();
+        if(playbackState(state.c_str())<0){state=metadata["PlayState"].as<String>();state.trim();state.toLowerCase();}
+        if(playbackState(state.c_str())<0) readEndpoint(backgroundPoll.ip,backgroundPoll.endpoint,"getPlayerStatus",backgroundPoll.extra,600);
+      }
+    }
+    backgroundPoll.elapsed=millis()-started;
+    backgroundPoll.state.store(3);
+  }
+}
+bool startBackgroundPoll(bool group) {
+  if(backgroundPollBusy() || activeEndpoint.chip==Chip::Unknown) return false;
+  if(!backgroundPollTask && xTaskCreatePinnedToCore(backgroundPollWorker,"player-poll",8192,nullptr,1,&backgroundPollTask,0)!=pdPASS) return false;
+  backgroundPoll.ip=deviceIp;backgroundPoll.endpoint=activeEndpoint;backgroundPoll.epoch=zoneEpoch;backgroundPoll.control=controlEpoch;backgroundPoll.artEpoch=a98ArtworkEpoch;
+  backgroundPoll.artwork=false;backgroundPoll.group=group;backgroundPoll.command=group || isCloud()?"getStatusEx":"getPlayerStatus";
+  backgroundPoll.body="";backgroundPoll.ok=false;
+  backgroundPoll.state.store(1);xTaskNotifyGive(backgroundPollTask);return true;
+}
+
 int zoneCount = 0;
 WiFiUDP discoveryUdp;
 WiFiUDP ssdpNotifyUdp;
@@ -386,6 +445,8 @@ struct DevicePreset { int slot=0; String name; };
 DevicePreset devicePresets[20];
 int devicePresetCount=0;
 String presetZone;
+int presetReadHttp=0;size_t presetReadBytes=0;
+String presetReadError="not_requested";
 int selectedPreset = 1;
 String trackTitle;
 String trackArtist;
@@ -413,7 +474,22 @@ void drawMetadata();
 PNG pngDecoder;
 JPEGDEC jpegDecoder;
 
+void resetSelectedZone() {
+  volumeDirty=false;volumeRetryAt=0;volumeFailures=0;volumeChangedAt=0;
+  feedbackKind=0;playing=muted=deviceOnline=groupKnown=isSlave=false;
+  masterIp=groupValue=trackTitle=trackArtist=currentMediaUri="";
+  artworkReady=artworkAttempted=false;
+  currentArtworkUrl=reportedArtworkUrl=lastArtAttemptUrl="";lastArtAttemptAt=0;
+  presetZone="";devicePresetCount=0;presetReadError="not_requested";
+  for(auto& preset:devicePresets) {preset.slot=0;preset.name="";}
+  portENTER_CRITICAL(&encoderMux);encoderRead=encoderWrite;encoderAccumulator=0;portEXIT_CRITICAL(&encoderMux);
+  lastPollAt=millis()-kPollIntervalMs;
+  lastGroupPollAt=millis()-kGroupPollMs;
+  lastArtworkPollAt=millis()-kArtworkPollMs+2500;
+}
+
 void invalidateArtwork() {
+  artworkCancel.store(true);
   artworkReady=artworkAttempted=false;
   currentArtworkUrl=reportedArtworkUrl=lastArtAttemptUrl="";
   lastArtAttemptAt=0;
@@ -508,8 +584,10 @@ String cleanPresetName(String name) {
 }
 bool parseKeyPresets(const String& response) {
   devicePresetCount=0;
-  const String context=decodeXml(xmlValue(response,"QueueContext"));
-  if(context.indexOf("<KeyList")<0 || context.indexOf("</KeyList>")<0) return false;
+  String context=decodeXml(xmlValue(response,"QueueContext"));
+  if(!context.length()) context=decodeXml(response);
+  context=xmlValue(context,"KeyList");
+  if(!context.length()) return false;
   int maximum=xmlValue(context,"MaxNumber").toInt();
   if(maximum<1 || maximum>20) return false;
   for(int slot=1;slot<=maximum;++slot) {
@@ -565,7 +643,7 @@ void resetA98State() {
 void a98ActiveChanged(int before,bool wakePoll=true) {
   if(before==a98Model.active) return;
   ++a98ArtworkEpoch;
-  invalidateArtwork();if(wakePoll) lastPollAt=millis()-kFallbackPollIntervalMs;
+  invalidateArtwork();if(wakePoll) lastPollAt=millis()-kPollIntervalMs;
   if(menuScreen==MenuScreen::Presets) drawMenu();
   else if(menuScreen==MenuScreen::Player) drawScreen();
 }
@@ -607,16 +685,15 @@ bool a98ReadKeyMapping(String& response) {
   if(!http.begin(client,"http://"+deviceIp+":59152/upnp/control/PlayQueue1")) return false;
   http.addHeader("Content-Type","text/xml; charset=utf-8");http.addHeader("SOAPAction","\"urn:schemas-wiimu-com:service:PlayQueue:1#GetKeyMapping\"");
   const int status=http.POST("<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:GetKeyMapping xmlns:u=\"urn:schemas-wiimu-com:service:PlayQueue:1\"/></s:Body></s:Envelope>");
-  if(status!=200 || http.getSize()>65536){http.end();return false;}
-  auto* stream=http.getStreamPtr();char chunk[513];uint32_t last=millis();response="";
-  while((http.connected() || stream->available()) && millis()-last<1200) {
-    int available=stream->available();if(available>0){int n=stream->readBytes(chunk,min(available,512));if(response.length()+n>65536){http.end();return false;}chunk[n]=0;response+=chunk;last=millis();}else delay(1);
-  }
-  http.end();return true;
+  presetReadHttp=status;
+  const bool ok=status==200 && readBoundedResponse(http,response);
+  presetReadBytes=response.length();presetReadError=ok?"":"http_or_body";
+  http.end();return ok;
 }
+
 bool readA98Presets() {
   String mapping;if(!a98ReadKeyMapping(mapping)) return false;
-  a98::Model next;if(!next.mapping(std::string(mapping.c_str()))) return false;
+  a98::Model next;if(!next.mapping(std::string(mapping.c_str()))) {presetReadError="xml_structure";return false;}
   bool needsRoutines=false;for(const auto& key:next.keys) if(!key.routine.empty()) needsRoutines=true;
   bool complete=true;
   if(needsRoutines) {
@@ -677,17 +754,21 @@ void maintainA98Subscriptions() {
 
 bool readDevicePresets() {
   devicePresetCount=0;presetZone=deviceIp;
+  presetReadHttp=0;presetReadBytes=0;presetReadError="read_failed";
   if(activeEndpoint.chip==Chip::A98) return readA98Presets();
   if(isWiiMPresetChip()) {
     String body;if(!request("getPresetInfo",body)) return false;
+    presetReadHttp=200;presetReadBytes=body.length();
     StaticJsonDocument<256> filter;
     filter["preset_list"][0]["number"]=true;filter["preset_list"][0]["name"]=true;
     DynamicJsonDocument doc(4096);
     if(deserializeJson(doc,body,DeserializationOption::Filter(filter))) return false;
-    return parseWiiMPresets(doc.as<JsonVariantConst>());
+    const bool parsed=parseWiiMPresets(doc.as<JsonVariantConst>());
+    presetReadError=parsed?"":"json_structure";return parsed;
   }
   if(isCloud()) {
     String body;if(!request("getPresetListInfo",body)) return false;
+    presetReadHttp=200;presetReadBytes=body.length();
     StaticJsonDocument<256> filter;
     filter["Presets"][0]["PresetNumber"]=true;filter["Presets"][0]["PresetName"]=true;
     DynamicJsonDocument doc(4096);
@@ -700,7 +781,7 @@ bool readDevicePresets() {
         devicePresets[devicePresetCount].slot=slot;devicePresets[devicePresetCount++].name=name;
       }
     }
-    return true;
+    presetReadError="";return true;
   }
   WiFiClient client;HTTPClient http;http.useHTTP10(true);
   http.setConnectTimeout(350);http.setTimeout(1200);
@@ -709,36 +790,21 @@ bool readDevicePresets() {
   http.addHeader("SOAPAction","\"urn:schemas-wiimu-com:service:PlayQueue:1#GetKeyMapping\"");
   const String body="<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:GetKeyMapping xmlns:u=\"urn:schemas-wiimu-com:service:PlayQueue:1\"/></s:Body></s:Envelope>";
   const int status=http.POST(body);
-  if(status!=200 || http.getSize()>65536) {http.end();return false;}
-  // Bound even a response without Content-Length. Never log token-bearing metadata.
-  String response;response.reserve(4096);char chunk[513];auto* stream=http.getStreamPtr();
-  uint32_t lastData=millis();
-  while((http.connected() || stream->available()) && millis()-lastData<1200) {
-    const int available=stream->available();
-    if(available>0) {
-      const int count=stream->readBytes(chunk,min(available,512));
-      if(response.length()+count>65536) {http.end();return false;}
-      chunk[count]=0;response+=chunk;lastData=millis();
-    } else delay(1);
-  }
-  http.end();return parseKeyPresets(response);
+  presetReadHttp=status;
+  String response;
+  const bool complete=status==200 && readBoundedResponse(http,response);
+  presetReadBytes=response.length();http.end();
+  if(!complete){presetReadError="http_or_body";return false;}
+  const bool parsed=parseKeyPresets(response);
+  presetReadError=parsed?"":"xml_structure";
+  return parsed;
 }
 
-void pollEncoder();
-void sendVolumeWhenReady();
-
-// Network artwork is fetched synchronously; keep the encoder and volume
-// command alive between incoming chunks instead of waiting for the cover.
-void serviceVolumeDuringArtwork() {
-  pollEncoder();
-  sendVolumeWhenReady();
-  if (WiFi.status() == WL_CONNECTED) {settingsServer.handleClient();pollA98Events();}
-}
 
 bool request(const String& command, String& response);
 String cleanMedia(String value) {
   value.trim(); String lower=value; lower.toLowerCase();
-  return lower=="unknown" || lower=="null" || lower=="http_music" ? String("") : value;
+  return lower=="unknown" || lower=="unknow" || lower=="null" || lower=="http_music" ? String("") : value;
 }
 String cleanArtworkUrl(String url) {
   url=decodeXml(cleanMedia(url));
@@ -746,65 +812,32 @@ String cleanArtworkUrl(String url) {
   return url.startsWith("http://") || url.startsWith("https://") ? url : String("");
 }
 int parsePlayback(String value) { value.trim(); value.toLowerCase(); return playbackState(value.c_str()); }
-String fetchSoapArtworkAddress();
-String fetchArtworkAddress() {
-  if (isCloud() && cleanArtworkUrl(reportedArtworkUrl).length()) return cleanArtworkUrl(reportedArtworkUrl);
-  if (activeEndpoint.chip != Chip::A31) {
-    String body;
-    if (request("getMetaInfo", body)) {
-      DynamicJsonDocument info(6144);
-      if (!deserializeJson(info, body)) {
-        JsonVariant data = info["metaData"].isNull() ? info.as<JsonVariant>() : info["metaData"].as<JsonVariant>();
-        const String title = String(data["title"] | ""), artist = String(data["artist"] | "");
-        // Reading artwork must not overwrite transport metadata with a different title source.
-        String art = String(data["albumArtURI"] | "");
-        if (art.isEmpty()) art = String(data["albumArtURI "] | "");
-        if(isCloud() && (title.isEmpty() || !cleanMedia(title).equalsIgnoreCase(trackTitle))) art="";
-        art=cleanArtworkUrl(art);
-        if (art.length()) return art;
-      }
-    }
-  }
-  if (isCloud()) return ""; // gmrender state is independent of A33 main playback
-  return fetchSoapArtworkAddress();
-}
-String fetchSoapArtworkAddress() {
-  WiFiClient client;
-  client.setTimeout(2);
-  const String body = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:GetPositionInfo xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"><InstanceID>0</InstanceID></u:GetPositionInfo></s:Body></s:Envelope>";
-  IPAddress target;
-  if (!target.fromString(deviceIp) || !client.connect(target, 49152, 350)) return "";
-  client.print(String("POST /upnp/control/rendertransport1 HTTP/1.1\r\n") +
-      "Host: " + deviceIp + ":49152\r\n" +
-      "Content-Type: text/xml; charset=\"utf-8\"\r\n" +
-      "SOAPAction: \"urn:schemas-upnp-org:service:AVTransport:1#GetPositionInfo\"\r\n" +
-      "Connection: close\r\nContent-Length: " + String(body.length()) + "\r\n\r\n" + body);
-  String response;
-  response.reserve(12000);
-  uint32_t lastByteAt = millis();
-  while ((client.connected() || client.available()) && millis() - lastByteAt < 2000 && response.length() < 24000) {
-    while (client.available()) {
-      response += static_cast<char>(client.read());
-      lastByteAt = millis();
-    }
-    serviceVolumeDuringArtwork();
-    delay(1);
-  }
-  client.stop();
+String fetchSoapArtworkAt(const String& ip,const Endpoint& endpoint) {
+  const uint16_t port=endpoint.chip==Chip::A98?59152:49152;
+  WiFiClient client;HTTPClient http;http.useHTTP10(true);
+  http.setConnectTimeout(350);http.setTimeout(800);
+  if(!http.begin(client,"http://"+ip+":"+String(port)+"/upnp/control/rendertransport1")) return "";
+  http.addHeader("Content-Type","text/xml; charset=utf-8");
+  http.addHeader("SOAPAction","\"urn:schemas-upnp-org:service:AVTransport:1#GetPositionInfo\"");
+  const int status=http.POST("<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:GetPositionInfo xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"><InstanceID>0</InstanceID></u:GetPositionInfo></s:Body></s:Envelope>");
+  String response;const bool ok=status==200 && readBoundedResponse(http,response,24000,2500);http.end();
+  if(!ok) return "";
   String raw=xmlValue(response,"TrackMetaData");
   if(raw.isEmpty()) raw=xmlValue(response,"CurrentTrackMetaData");
   if(raw.isEmpty()) raw=xmlValue(response,"AVTransportURIMetaData");
-  String metadata = decodeXml(raw);
-  String url = decodeXml(xmlValue(metadata, "albumArtURI"));
-  if (url.startsWith("/")) url = "http://" + deviceIp + ":49152" + url;
+  String metadata=decodeXml(raw),url=decodeXml(xmlValue(metadata,"albumArtURI"));
+  if(url.startsWith("/")) url="http://"+ip+":"+String(port)+url;
   return url;
 }
+
 
 bool downloadAndDecodeArtOriginal(String url) {
   // This exact Qobuz CDN hostname was verified to serve the same cover over
   // HTTP 200. Do not downgrade other HTTPS hosts without checking them.
 
+  const uint32_t downloadEpoch=zoneEpoch,downloadStarted=millis();
   for (int redirects = 0; redirects < 4; ++redirects) {
+    if(artworkCancel.load() || zoneEpoch!=downloadEpoch || otaActive || rebootAfterResponse || millis()-downloadStarted>6000) return false;
     // HTTPS covers use the same local TLS client as chip-aware control.
     // TuneIn A31 test artwork was verified to return HTTP 200 directly.
     if (!url.startsWith("http://") && !url.startsWith("https://")) return false;
@@ -818,7 +851,7 @@ bool downloadAndDecodeArtOriginal(String url) {
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
-    http.addHeader("User-Agent","airControl-KNOB/0.8.16");
+    http.addHeader("User-Agent","airControl-KNOB/0.8.17");
     http.addHeader("Accept","image/*,*/*;q=0.8");
     http.addHeader("Accept-Encoding","identity");
     const int status = http.GET();
@@ -846,7 +879,9 @@ bool downloadAndDecodeArtOriginal(String url) {
     WiFiClient* stream = http.getStreamPtr();
     size_t length = 0;
     uint32_t lastDataAt = millis();
-    while ((http.connected() || stream->available()) && millis() - lastDataAt < 1800) {
+    while ((http.connected() || stream->available()) && millis() - lastDataAt < 1800 && millis()-downloadStarted<6000) {
+      if(declaredSize>=0 && length==size_t(declaredSize)) break;
+      if(artworkCancel.load() || zoneEpoch!=downloadEpoch || otaActive || rebootAfterResponse) break;
       const int available = stream->available();
       if (available > 0) {
         const size_t amount = min(static_cast<size_t>(available), capacity - length);
@@ -854,13 +889,14 @@ bool downloadAndDecodeArtOriginal(String url) {
         length += stream->readBytes(bytes + length, amount);
         lastDataAt = millis();
       } else delay(1);
-      serviceVolumeDuringArtwork();
+      delay(1);
     }
     http.end();
     bool ok = false;
     sourceWidth=sourceHeight=0;
     memset(nextArtPixels, 0, sizeof(nextArtPixels));
-    const bool complete=declaredSize<=0 || length==size_t(declaredSize);
+    const bool complete=!artworkCancel.load() && zoneEpoch==downloadEpoch && !otaActive && !rebootAfterResponse &&
+                        millis()-downloadStarted<6000 && (declaredSize<0 ? length<capacity : length==size_t(declaredSize));
     if (complete && length > 8 && bytes[0] == 0x89 && bytes[1] == 'P' && bytes[2] == 'N') {
       if (pngDecoder.openRAM(bytes, length, pngLine) == PNG_SUCCESS) {
         sourceWidth = pngDecoder.getWidth();
@@ -888,7 +924,7 @@ bool downloadAndDecodeArtOriginal(String url) {
       }
     }
     free(bytes);
-    if (ok) memcpy(artPixels,nextArtPixels,sizeof(artPixels));
+    // The UI task copies nextArtPixels only after a matching result is published.
     Serial.printf("Artwork: %s (%u bytes, source %dx%d, target %d)\n", ok ? "decoded" : "decode failed", static_cast<unsigned>(length), sourceWidth, sourceHeight, kArtSize);
     return ok;
   }
@@ -904,29 +940,65 @@ bool downloadAndDecodeArt(String url) {
   return downloadAndDecodeArtOriginal(url);
 }
 
-void pollArtwork() {
-  if (WiFi.status() != WL_CONNECTED || menuScreen != MenuScreen::Player) return;
-  const String requestedDevice=deviceIp,requestedTitle=trackTitle;
-  const uint32_t requestedArtEpoch=a98ArtworkEpoch;
-  String url=cleanArtworkUrl(fetchArtworkAddress());
-  if(deviceIp!=requestedDevice || trackTitle!=requestedTitle || requestedArtEpoch!=a98ArtworkEpoch) return;
-  lastA31ActivityAt=millis();
-  if(url.isEmpty()) { const bool redraw=artworkReady; invalidateArtwork(); if(redraw) drawScreen(); return; }
-  if(url==currentArtworkUrl && artworkReady) return;
-  if(url==lastArtAttemptUrl && millis()-lastArtAttemptAt<5000) return;
-  lastArtAttemptUrl=url; lastArtAttemptAt=millis();
-  bool ok=downloadAndDecodeArt(url);
-  if(!ok && !isCloud()) {
-    const String fallback=cleanArtworkUrl(fetchSoapArtworkAddress());
-    if(fallback.length() && fallback!=url) {
-      if(fallback==currentArtworkUrl && artworkReady) return;
-      if(downloadAndDecodeArt(fallback)) {url=fallback;ok=true;}
+String jobArtworkUrl(String url) {
+  url=decodeXml(cleanMedia(url));
+  if(url.startsWith("/")) url=String(backgroundPoll.endpoint.tls?"https://":"http://")+backgroundPoll.ip+":"+String(backgroundPoll.endpoint.port)+url;
+  return url.startsWith("http://") || url.startsWith("https://")?url:String("");
+}
+void runArtworkJob() {
+  backgroundPoll.ok=backgroundPoll.unchanged=false;backgroundPoll.body="";
+  String url;bool usedSoap=false;
+  const bool cloud=backgroundPoll.endpoint.chip==Chip::A33;
+  if(cloud) url=jobArtworkUrl(backgroundPoll.reported);
+  if(url.isEmpty() && backgroundPoll.endpoint.chip!=Chip::A31 && !artworkCancel.load()) {
+    String body;
+    if(readEndpoint(backgroundPoll.ip,backgroundPoll.endpoint,"getMetaInfo",body,800)) {
+      DynamicJsonDocument doc(6144);
+      if(!deserializeJson(doc,body)) {
+        JsonVariant data=doc["metaData"].isNull()?doc.as<JsonVariant>():doc["metaData"].as<JsonVariant>();
+        const String title=cleanMedia(String(data["title"]|""));
+        if(!cloud || (title.length() && title.equalsIgnoreCase(backgroundPoll.title))) {
+          url=jobArtworkUrl(String(data["albumArtURI"]|data["albumArtURI "]|""));
+        }
+      }
     }
   }
-  if(deviceIp!=requestedDevice || trackTitle!=requestedTitle || requestedArtEpoch!=a98ArtworkEpoch) return;
-  if(ok) { currentArtworkUrl=url; artworkAttempted=artworkReady=true; drawScreen(); }
-  else { const bool redraw=artworkReady; artworkReady=artworkAttempted=false; currentArtworkUrl=""; if(redraw) drawScreen(); }
-  Serial.println(ok?"Artwork committed":"Artwork unavailable; cover area left blank");
+  if(url.isEmpty() && !cloud && !artworkCancel.load()) {url=jobArtworkUrl(fetchSoapArtworkAt(backgroundPoll.ip,backgroundPoll.endpoint));usedSoap=true;}
+  backgroundPoll.body=url;
+  if(url.isEmpty() || artworkCancel.load()) return;
+  if(url==backgroundPoll.currentUrl && backgroundPoll.hadArtwork) {backgroundPoll.unchanged=true;return;}
+  if(url==backgroundPoll.lastAttempt && millis()-backgroundPoll.lastAttemptAt<5000) {backgroundPoll.unchanged=true;return;}
+  backgroundPoll.ok=downloadAndDecodeArt(url);
+  if(!backgroundPoll.ok && !cloud && !usedSoap && !artworkCancel.load()) {
+    const String fallback=jobArtworkUrl(fetchSoapArtworkAt(backgroundPoll.ip,backgroundPoll.endpoint));
+    if(fallback.length() && fallback!=url) {
+      if(fallback==backgroundPoll.currentUrl && backgroundPoll.hadArtwork) {backgroundPoll.body=fallback;backgroundPoll.unchanged=true;return;}
+      if(downloadAndDecodeArt(fallback)) {backgroundPoll.body=fallback;backgroundPoll.ok=true;}
+    }
+  }
+}
+void commitArtworkJob() {
+  if(artworkCancel.load() || backgroundPoll.title!=trackTitle || menuScreen!=MenuScreen::Player) return;
+  if(backgroundPoll.unchanged) return;
+  lastArtAttemptUrl=backgroundPoll.body;lastArtAttemptAt=millis();
+  if(backgroundPoll.ok) {
+    memcpy(artPixels,nextArtPixels,sizeof(artPixels));currentArtworkUrl=backgroundPoll.body;
+    artworkAttempted=artworkReady=true;drawScreen();
+  } else {
+    const bool redraw=artworkReady;artworkReady=artworkAttempted=false;currentArtworkUrl="";
+    if(redraw) drawScreen();
+  }
+}
+void pollArtwork() {
+  if(WiFi.status()!=WL_CONNECTED || menuScreen!=MenuScreen::Player || backgroundPollBusy() || activeEndpoint.chip==Chip::Unknown) return;
+  if(!backgroundPollTask && xTaskCreatePinnedToCore(backgroundPollWorker,"player-poll",8192,nullptr,1,&backgroundPollTask,0)!=pdPASS) return;
+  backgroundPoll.ip=deviceIp;backgroundPoll.endpoint=activeEndpoint;backgroundPoll.epoch=zoneEpoch;
+  backgroundPoll.artEpoch=a98ArtworkEpoch;backgroundPoll.control=controlEpoch;
+  backgroundPoll.artwork=true;backgroundPoll.title=trackTitle;backgroundPoll.reported=reportedArtworkUrl;
+  backgroundPoll.currentUrl=currentArtworkUrl;backgroundPoll.hadArtwork=artworkReady;
+  backgroundPoll.lastAttempt=lastArtAttemptUrl;backgroundPoll.lastAttemptAt=lastArtAttemptAt;
+  backgroundPoll.body="";backgroundPoll.extra="";artworkCancel.store(false);
+  backgroundPoll.state.store(1);xTaskNotifyGive(backgroundPollTask);
 }
 
 String decodeMetadata(const char* value) {
@@ -1043,22 +1115,8 @@ bool request(const String& command, String& response) {
 }
 
 
-bool refreshGroupStatus() {
-  String body;
-  lastGroupPollAt = millis();
-  if (!request("getStatusEx", body)) {
-    const bool wasSlave = groupKnown && isSlave;
-    groupKnown = false;
-    if (wasSlave && menuScreen == MenuScreen::Player) drawScreen();
-    return false;
-  }
-  DynamicJsonDocument doc(12288);
-  if (deserializeJson(doc, body)) {
-    const bool wasSlave = groupKnown && isSlave;
-    groupKnown = false;
-    if (wasSlave && menuScreen == MenuScreen::Player) drawScreen();
-    return false;
-  }
+void updateGroupStatus(JsonVariantConst doc) {
+  lastGroupPollAt=millis();
   const String nextMaster = isCloud() ? String(doc["Host"] | "0") : doc["master_ip"].as<String>();
   const String nextGroup = isCloud() ? String(doc["MultiroomStatus"] | "free") : doc["group"].as<String>();
   // A31 may retain a master_ip after leaving. group=0 reports that it is free.
@@ -1074,13 +1132,32 @@ bool refreshGroupStatus() {
   if (changed) Serial.printf("A31 group=%s master_ip=%s slave=%d\n",
                              groupValue.c_str(), masterIp.c_str(), isSlave ? 1 : 0);
   if (changed && menuScreen == MenuScreen::Player) drawScreen();
+}
+
+bool refreshGroupStatus(const String* prefetched=nullptr,bool readOk=true) {
+  String body=prefetched?*prefetched:String("");
+  lastGroupPollAt = millis();
+  if (prefetched ? !readOk : !request("getStatusEx", body)) {
+    const bool wasSlave = groupKnown && isSlave;
+    groupKnown = false;
+    if (wasSlave && menuScreen == MenuScreen::Player) drawScreen();
+    return false;
+  }
+  DynamicJsonDocument doc(12288);
+  if (deserializeJson(doc, body)) {
+    const bool wasSlave = groupKnown && isSlave;
+    groupKnown = false;
+    if (wasSlave && menuScreen == MenuScreen::Player) drawScreen();
+    return false;
+  }
+  updateGroupStatus(doc.as<JsonVariantConst>());
   return true;
 }
 
-void pollDevice() {
-  String body;
+void pollDevice(const String* prefetched=nullptr,bool readOk=true,const String* extraPlayer=nullptr) {
+  String body=prefetched?*prefetched:String("");
   if (activeEndpoint.chip == Chip::Unknown && !request("getStatusEx", body)) { deviceOnline = false; return; }
-  if (!request(isCloud() ? "getStatusEx" : "getPlayerStatus", body)) {
+  if (prefetched ? !readOk : !request(isCloud() ? "getStatusEx" : "getPlayerStatus", body)) {
     deviceOnline = false;
     return;
   }
@@ -1090,6 +1167,8 @@ void pollDevice() {
     return;
   }
   if (isCloud()) {
+    updateGroupStatus(doc.as<JsonVariantConst>());
+    readSourceCapabilities(doc.as<JsonVariantConst>());
     JsonVariant primary=doc["AllMate"].as<JsonVariant>();
     JsonVariant alt=primary.is<JsonObject>() && primary.size()>0 ? primary : doc["AltMate"].as<JsonVariant>();
     String state=cleanMedia(doc["PlayState"].as<String>());
@@ -1098,7 +1177,8 @@ void pollDevice() {
     DynamicJsonDocument player(4096);
     if(parsePlayback(state)<0) {
       String extra;
-      if(request("getPlayerStatus",extra) && !deserializeJson(player,extra)) {
+      if(extraPlayer) extra=*extraPlayer;
+      if((extraPlayer ? extra.length()>0 : request("getPlayerStatus",extra)) && !deserializeJson(player,extra)) {
         state=cleanMedia(player["PlayStatus"].as<String>());
         if(parsePlayback(state)<0) state=cleanMedia(player["status"].as<String>());
       }
@@ -1124,7 +1204,8 @@ void pollDevice() {
   }
   const char* state = doc["status"] | "";
   muted = doc["mute"].as<String>() == "1";
-  const bool newPlaying = strcmp(state, "play") == 0;
+  const int parsedPlaying=parsePlayback(String(state));
+  const bool newPlaying = parsedPlaying<0 ? playing : parsedPlaying==1;
   // A31 may return vol as "32" (JSON string), not as a JSON number.
   // ArduinoJson's integer fallback can silently leave the previous value.
   int remoteVolume = volume;
@@ -1160,6 +1241,19 @@ void pollDevice() {
   }
   if (changed) drawScreen();
   else if (volumeChanged) drawVolumeUpdate();
+}
+
+void serviceBackgroundPoll() {
+  if(backgroundPoll.state.load()!=3) return;
+  if(backgroundPoll.epoch==zoneEpoch && (backgroundPoll.artwork || backgroundPoll.control==controlEpoch) && backgroundPoll.artEpoch==a98ArtworkEpoch && backgroundPoll.ip==deviceIp &&
+     backgroundPoll.endpoint.chip==activeEndpoint.chip && !otaActive && !rebootAfterResponse) {
+    if(backgroundPoll.artwork) commitArtworkJob();
+    else if(backgroundPoll.group) refreshGroupStatus(&backgroundPoll.body,backgroundPoll.ok);
+    else pollDevice(&backgroundPoll.body,backgroundPoll.ok,&backgroundPoll.extra);
+    lastA31ActivityAt=millis();
+  }
+  else if(backgroundPoll.epoch==zoneEpoch) lastPollAt=millis()-kPollIntervalMs;
+  backgroundPoll.body="";backgroundPoll.extra="";backgroundPoll.state.store(0);
 }
 
 void sendVolumeWhenReady() {
@@ -1208,32 +1302,34 @@ void servicePresetResume() {
   presetResume.cancel(); // At most one read and one resume, never repeat choicePreset.
   const int state=readA33PresetPlayback();
   lastA31ActivityAt=millis();
-  if(state==1) {lastPollAt=millis()-kFallbackPollIntervalMs;return;}
+  if(state==1) {lastPollAt=millis()-kPollIntervalMs;return;}
   // Unknown status uses the hardware-tested choice -> 2s -> resume fallback.
   // This is not claimed necessary for every preset. No automatic retry on Not.
   String body;
   const bool ok=readEndpoint(deviceIp,activeEndpoint,"setPlayerCmd:resume",body,800);
   Serial.println(ok ? "A33 preset resume sent" : "A33 preset resume failed");
   lastA31ActivityAt=millis();
-  lastPollAt=millis()-kFallbackPollIntervalMs;
+  lastPollAt=millis()-kPollIntervalMs;
 }
 
+uint8_t* volumeArcCache=nullptr;
+void initVolumeArcCache() {
+  if(!psramFound()) return; // Keep internal RAM available on boards without PSRAM.
+  volumeArcCache=static_cast<uint8_t*>(heap_caps_malloc(240*240,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));
+  if(!volumeArcCache) return;
+  for(int y=0;y<240;++y)for(int x=0;x<240;++x)volumeArcCache[y*240+x]=volumeArcLevel(x,y);
+}
 void drawVolumeArc() {
   // Paint each arc pixel exactly once in its final colour: never grey then yellow.
   const uint16_t inactive = display.color565(55, 55, 55);
-  constexpr float r = 112.0f, half = 5.0f;
-  const float end = 220.0f * volume / 100.0f;
+
   display.startWrite();
   for (int y = max(2,display.clipTop()); y < min(239,display.clipBottom()); ++y) {
     int runStart = -1; uint16_t runColor = 0;
     for (int x = 2; x <= 239; ++x) {
-      const float dx = x - 120.0f, dy = y - 120.0f;
-      const float distance2 = dx*dx + dy*dy;
-      const bool ring = distance2 >= (r-half)*(r-half) && distance2 <= (r+half)*(r+half);
-      float angle = ring ? atan2f(dy, dx) * 180.0f / PI - 160.0f : 360.0f;
-      if (angle < 0) angle += 360.0f;
-      const bool inside = x < 239 && ring && angle <= 220.0f;
-      const uint16_t color = volume > 0 && angle <= end ? accentColor() : inactive;
+      const uint8_t level=volumeArcCache?volumeArcCache[y*240+x]:volumeArcLevel(x,y);
+      const bool inside=level!=255;
+      const uint16_t color=volume>=level ? accentColor() : inactive;
       if (runStart >= 0 && (!inside || color != runColor)) {
         display.fillRect(runStart, y, x-runStart, 1, runColor); runStart = -1;
       }
@@ -1244,11 +1340,12 @@ void drawVolumeArc() {
 }
 
 void drawVolumeLabel() {
+  if(display.clipBottom()<=210 || display.clipTop()>=210+kGlyphHeight) return;
   const String label = "VOL " + String(volume) + "%";
   const int width = 120, left = 60, y = 210;
   const int origin = (width - label.length()*kGlyphWidth)/2;
   uint16_t rowPixels[120];
-  for (int row=0; row<kGlyphHeight; ++row) {
+  for (int row=max(0,display.clipTop()-y); row<min(kGlyphHeight,display.clipBottom()-y); ++row) {
     for (int x=0; x<width; ++x) {
       const int glyphX = x-origin;
       bool ink = false;
@@ -1263,7 +1360,7 @@ void drawVolumeLabel() {
   }
 }
 
-// Compose the whole 240x240 frame offscreen, then show it in one transfer.
+// Update the arc and label without clearing their background first.
 void drawVolumeUpdate() {
   if (menuScreen == MenuScreen::Player) { drawVolumeArc(); drawVolumeLabel(); }
 }
@@ -1271,6 +1368,7 @@ void drawVolumeUpdate() {
 void drawWindow(const String& value, int x, int y, int visible, int scale,
                 int offset, uint16_t foreground, uint16_t background,
                 bool enlarged = false) {
+  if(y>=display.clipBottom() || y+(enlarged?18:kGlyphHeight*scale)<=display.clipTop()) return;
   uint32_t chars[128] = {};
   size_t pos = 0;
   int count = 0;
@@ -1335,6 +1433,7 @@ int sansMenuWidth(const String& value, bool selected) {
 // Proportional, antialiased Sans menu text with ASCII and Cyrillic glyphs.
 void drawSansMenu(const String& text, int x, int y, int width, int height,
                   bool selected, int offset, uint16_t foreground, uint16_t background) {
+  if(y>=display.clipBottom() || y+height<=display.clipTop()) return;
   const SansGlyph* glyphs = selected ? kSansSelectedGlyphs : kSansNormalGlyphs;
   const uint8_t* pixels = selected ? kSansSelectedPixels : kSansNormalPixels;
   uint32_t chars[128] = {};
@@ -1359,7 +1458,7 @@ void drawSansMenu(const String& text, int x, int y, int width, int height,
     const int gy = baseline + glyph.top;
     for (int row = 0; row < glyph.height; ++row) {
       const int py = gy + row;
-      if (py < y || py >= y + height) continue;
+      if (py < y || py >= y + height || py<display.clipTop() || py>=display.clipBottom()) continue;
       for (int col = 0; col < glyph.width; ++col) {
         const int px = gx + col;
         if (px < x || px >= x + width) continue;
@@ -1693,6 +1792,7 @@ void webPage(const String& notice = "") {
 let zoneTimer;
 const byId=id=>document.getElementById(id);
 async function loadZones(){
+ if(globalThis.knobUploading)return;
  try{
   const r=await fetch('/zones',{cache:'no-store'});if(!r.ok)throw Error('Не удалось получить список');
   const d=await r.json(),list=byId('zone-list'),old=list.value;
@@ -1753,16 +1853,18 @@ function uploadFirmware(form,size){
  xhr.onload=()=>{if(xhr.status>=200&&xhr.status<300){uploadProgress.value=100;resolve(xhr.responseText);}else reject(Error(xhr.responseText||'HTTP '+xhr.status));};
  xhr.onerror=()=>reject(Error('Соединение потеряно. Проверьте статус на панели перед повтором.'));
  xhr.ontimeout=()=>reject(Error('Нет ответа от KNOB. Проверьте статус на панели.'));
- xhr.onabort=()=>reject(Error('Передача прервана'));xhr.send(form);
+ xhr.onabort=()=>reject(Error('Передача прервана'));globalThis.knobUploading=true;xhr.send(form);
  });
 }
 function updateSucceeded(){otaStatus.textContent='Прошивка установлена. KNOB перезагружается…';setTimeout(()=>location.replace('/'),7000);}
 document.getElementById('firmware-upload').onsubmit=async e=>{
  e.preventDefault();if(uploadBusy)return;
- const file=e.target.querySelector('input[type=file]').files[0];if(!file)return;
+ const file=e.target.querySelector('input[type=file]').files[0];if(!file){otaStatus.textContent='Выберите файл прошивки .bin';return;}
+ if(!/\.bin$/i.test(file.name)||file.size<=0||file.size>8*1024*1024){otaStatus.textContent='Нужен файл .bin размером до 8 МБ';return;}
+ otaStatus.textContent='Начинаем передачу прошивки…';if(otaStatus.scrollIntoView)otaStatus.scrollIntoView({block:'center'});
  uploadBusy=true;const button=e.target.querySelector('button');button.disabled=true;otaInstall.disabled=true;
  try{await uploadFirmware(new FormData(e.target),file.size);updateSucceeded();}
- catch(err){otaStatus.textContent='Ошибка обновления: '+err.message;button.disabled=false;uploadBusy=false;}
+ catch(err){globalThis.knobUploading=false;otaStatus.textContent='Ошибка обновления: '+err.message;button.disabled=false;uploadBusy=false;}
 };
 const otaStatus=document.getElementById('ota-status'),otaInstall=document.getElementById('ota-install');
 async function otaFetch(url){const c=new AbortController(),t=setTimeout(()=>c.abort(),90000);try{const r=await fetch(url,{cache:'no-store',signal:c.signal});if(!r.ok)throw Error('HTTP '+r.status);return r;}finally{clearTimeout(t);}}
@@ -1782,7 +1884,7 @@ otaInstall.onclick=async()=>{
  if(bytes.length!==otaManifest.size||bytes[0]!==0xe9)throw Error('Неверный размер или формат прошивки');
  const form=new FormData();form.append('md5',otaManifest.md5);form.append('firmware',new Blob([bytes]),'airControl-KNOB-v'+otaManifest.version+'.bin');
  await uploadFirmware(form,bytes.length);updateSucceeded();
- }catch(e){otaStatus.textContent='Ошибка обновления: '+e.message;otaInstall.disabled=false;uploadBusy=false;}
+ }catch(e){globalThis.knobUploading=false;otaStatus.textContent='Ошибка обновления: '+e.message;otaInstall.disabled=false;uploadBusy=false;}
 };
 </script></section>)HTML";
   page.replace("</html>", "<meta name='knob-version' content='" + String(kFirmwareVersion) + "'>" + updateUi + "</html>");
@@ -1811,7 +1913,10 @@ void startSettingsWeb() {
   settingsServer.collectHeaders(otaHeaders, 1);
   settingsServer.on("/", HTTP_GET, []() { webPage(); });
   settingsServer.on("/health",HTTP_GET,[](){
-    StaticJsonDocument<512> doc;
+    StaticJsonDocument<1024> doc;
+    doc["background_poll"]=backgroundPoll.state.load();doc["background_job"]=backgroundPoll.artwork?"artwork":"status";doc["zone_epoch"]=zoneEpoch.load();
+    doc["zone_ip"]=deviceIp;doc["zone_chip"]=chipName(activeEndpoint.chip);
+    doc["preset_http"]=presetReadHttp;doc["preset_bytes"]=presetReadBytes;doc["preset_error"]=presetReadError;
     doc["firmware"]=kFirmwareVersion;doc["uptime_s"]=millis()/1000;
     doc["free_heap"]=ESP.getFreeHeap();doc["min_free_heap"]=ESP.getMinFreeHeap();
     doc["largest_free_block"]=heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
@@ -1851,6 +1956,7 @@ void startSettingsWeb() {
     cancelZoneScan();
     deviceIp = zones[found].ip;
     applyEndpoint(zones[found].endpoint);
+    resetSelectedZone();
     settings.putString("device", deviceIp);
     settings.putUChar("chip", uint8_t(activeEndpoint.chip));
     settings.putUShort("port", activeEndpoint.port);
@@ -1859,7 +1965,7 @@ void startSettingsWeb() {
     groupKnown = isSlave = deviceOnline = volumeDirty = false;
     masterIp = groupValue = trackTitle = trackArtist = currentArtworkUrl = "";
     artworkReady = artworkAttempted = false;
-    lastPollAt = millis() - kFallbackPollIntervalMs;
+    lastPollAt = millis() - kPollIntervalMs;
     lastGroupPollAt = millis() - kGroupPollMs;
     lastArtworkPollAt = millis() - kArtworkPollMs + 2500;
     settingsServer.send(200, "text/plain; charset=utf-8", "Zone selected and saved");
@@ -1904,7 +2010,7 @@ void startSettingsWeb() {
     []() {
       const bool ok = otaUploadFinished && !otaUploadFailed && !Update.hasError();
       settingsServer.send(ok ? 200 : 500, "text/plain; charset=utf-8",
-        ok ? "Firmware installed. KNOB is restarting." : "Firmware update failed; existing firmware is retained.");
+        ok ? String("Firmware installed. KNOB is restarting.") : String("Firmware update failed: ")+otaError+" (Update error "+String(Update.getError())+"). Existing firmware is retained.");
       otaActive = false;
       portENTER_CRITICAL(&encoderMux); encoderRead=encoderWrite; encoderAccumulator=0; portEXIT_CRITICAL(&encoderMux);
       drawOtaProgress(ok ? "RESTARTING" : "UPDATE FAILED", true);
@@ -1914,30 +2020,35 @@ void startSettingsWeb() {
       HTTPUpload& upload = settingsServer.upload();
       if (upload.status == UPLOAD_FILE_START) {
         cancelZoneScan();
-        otaActive = true;
+        otaActive = true;artworkCancel.store(true);
         const long requestedSize = settingsServer.header("X-Firmware-Size").toInt();
         otaExpectedBytes = requestedSize > 0 && requestedSize <= 8*1024*1024 ? size_t(requestedSize) : 0;
         otaWrittenBytes = 0;
         portENTER_CRITICAL(&encoderMux); encoderRead=encoderWrite; encoderAccumulator=0; portEXIT_CRITICAL(&encoderMux);
         drawOtaProgress("RECEIVING", true);
-        otaUploadFinished = false;
-        otaUploadFailed = !upload.filename.endsWith(".bin") || !Update.begin(UPDATE_SIZE_UNKNOWN);
+        otaUploadFinished = false;otaError="";
+        String filename=upload.filename;filename.toLowerCase();
+        otaUploadFailed=!filename.endsWith(".bin");
+        if(otaUploadFailed) otaError="choose a .bin firmware file";
+        else if(!Update.begin(otaExpectedBytes?otaExpectedBytes:UPDATE_SIZE_UNKNOWN)) {otaUploadFailed=true;otaError="cannot start flash write";}
+
         const String expectedMd5 = settingsServer.arg("md5");
         if (!otaUploadFailed && expectedMd5.length()) {
           bool valid = expectedMd5.length() == 32;
           for (size_t i = 0; i < expectedMd5.length(); ++i) valid = valid && isxdigit(static_cast<unsigned char>(expectedMd5[i]));
-          if (!valid || !Update.setMD5(expectedMd5.c_str())) { Update.abort(); otaUploadFailed = true; }
+          if (!valid || !Update.setMD5(expectedMd5.c_str())) { Update.abort(); otaUploadFailed = true; otaError="invalid MD5"; }
         }
       } else if (upload.status == UPLOAD_FILE_WRITE && !otaUploadFailed) {
-        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) { Update.abort(); otaUploadFailed = true; drawOtaProgress("WRITE FAILED", true); }
+        if ((otaExpectedBytes && otaWrittenBytes+upload.currentSize>otaExpectedBytes) || Update.write(upload.buf, upload.currentSize) != upload.currentSize) { Update.abort(); otaUploadFailed = true; otaError="flash write or size mismatch"; drawOtaProgress("WRITE FAILED", true); }
         else { otaWrittenBytes += upload.currentSize; drawOtaProgress("WRITING FLASH"); }
       } else if (upload.status == UPLOAD_FILE_END && !otaUploadFailed) {
         drawOtaProgress("VERIFYING", true);
-        if (!Update.end(true)) otaUploadFailed = true;
+        if(otaExpectedBytes && otaWrittenBytes!=otaExpectedBytes) {Update.abort();otaUploadFailed=true;otaError="incomplete upload";}
+        else if (!Update.end(otaExpectedBytes==0)) {otaUploadFailed = true;otaError="firmware verification failed";}
         else otaUploadFinished = true;
         drawOtaProgress(otaUploadFinished ? "COMPLETE" : "UPDATE FAILED", true);
       } else if (upload.status == UPLOAD_FILE_ABORTED) {
-        Update.abort(); otaUploadFailed = true; otaActive = false; drawOtaProgress("UPLOAD ABORTED", true);
+        Update.abort(); otaUploadFailed = true; otaError="upload aborted"; otaActive = false; drawOtaProgress("UPLOAD ABORTED", true);
       }
     });
   settingsServer.begin();
@@ -2249,7 +2360,9 @@ bool sendA31EqPreset(int index) {
 
 void handleTcpMessage(const String& message) {
   if (message.startsWith("AXX+VOL+") && message.length() >= 11) {
-    const int n = message.substring(8, 11).toInt();
+    const String digits=message.substring(8,11);
+    if(strspn(digits.c_str(),"0123456789")!=3) return;
+    const int n = digits.toInt();
     if (n >= 0 && n <= 100 && !localVolumePending() && volume != n) {
       volume = n;
       if (menuScreen == MenuScreen::Player) drawVolumeUpdate();
@@ -2264,7 +2377,9 @@ void handleTcpMessage(const String& message) {
     StaticJsonDocument<2048> doc;
     if (deserializeJson(doc, message.substring(start, end + 1))) return;
     const String state = doc["status"] | "";
-    const bool next = state == "play";
+    const int parsed=parsePlayback(state);
+    if(parsed<0) return;
+    const bool next = parsed==1;
     if (next != playing) {
       playing = next;
       if (menuScreen == MenuScreen::Player) drawScreen();
@@ -2308,6 +2423,7 @@ bool ensureA31Tcp() {
   a31Tcp.setTimeout(1);
   IPAddress target;
   const bool connected = target.fromString(deviceIp) && a31Tcp.connect(target, isCloud() ? 1234 : 8899, 350);
+  if (connected) {++tcpConnectionEpoch;a31Tcp.setNoDelay(true);}
   if (connected) Serial.printf("%s TCP connected\n", chipName(activeEndpoint.chip));
   return connected;
 }
@@ -2316,9 +2432,9 @@ void pollA31Tcp(String* reply = nullptr) {
   if (!a31Tcp.connected()) return;
   if (isCloud()) {
     // JSON events may be concatenated or fragmented; frame by braces, respecting strings.
-    static String previousIp;
+    static String previousIp; static uint32_t previousEpoch=0;
     static String event; static int depth = 0; static bool quoted = false, escaped = false;
-    if (previousIp != deviceIp) { previousIp = deviceIp; event = ""; depth = 0; quoted = escaped = false; }
+    if (previousIp != deviceIp || previousEpoch!=tcpConnectionEpoch) { previousEpoch=tcpConnectionEpoch; previousIp = deviceIp; event = ""; depth = 0; quoted = escaped = false; }
     int budget = 2048;
     while (a31Tcp.available() && budget-- > 0) {
       const char c = char(a31Tcp.read());
@@ -2391,7 +2507,9 @@ bool mcuCommand(const String& payload, String* reply) {
     else return false;
     if (!ensureA31Tcp()) return false;
     json += '\n';
-    return a31Tcp.write(reinterpret_cast<const uint8_t*>(json.c_str()), json.length()) == json.length();
+    const bool sent=a31Tcp.write(reinterpret_cast<const uint8_t*>(json.c_str()),json.length())==json.length();
+    if(!sent) a31Tcp.stop();
+    return sent;
   }
   if (activeEndpoint.chip != Chip::A31) return false;
   if (!ensureA31Tcp()) return false;
@@ -2541,6 +2659,8 @@ bool saveGraphicBand() {
   return readGraphicEq() && graphicBands[editingBand] == editingBandValue;
 }
 void chooseMenuItem() {
+  ++controlEpoch;
+  if(selectedItem<0 || selectedItem>=menuCount()) {menuMessage="NO ITEMS";drawMenu();return;}
   String body;
   switch (menuScreen) {
     case MenuScreen::Home: {
@@ -2584,12 +2704,11 @@ void chooseMenuItem() {
         if (sent) {
         if(isCloud() && !unconfirmed) {presetResumeZone=deviceIp;presetResume.schedule(millis());}
         menuScreen = MenuScreen::Player;
-        artworkReady = artworkAttempted = false;
-        currentArtworkUrl = "";
+        invalidateArtwork();
         // Let A31 change tracks before fetching its artwork; volume stays live.
         lastArtworkPollAt = millis() - kArtworkPollMs + 2500;
         showFeedback(unconfirmed ? 4 : 3);
-        lastPollAt = millis() - kFallbackPollIntervalMs;
+        lastPollAt = millis() - kPollIntervalMs;
         drawScreen();
         return;
         }
@@ -2601,8 +2720,7 @@ void chooseMenuItem() {
       menuMessage = request("setPlayerCmd:switchmode:" + (sourceCapabilitiesKnown ? discoveredSourceModes[selectedItem] : isCloud() ? (selectedItem == 4 ? String("HDMI ARC") : String(kSourceItems[selectedItem])) : String(kSourceModes[selectedItem])), body)
                         ? "SOURCE SELECTED" : "SOURCE FAILED";
       if (menuMessage == "SOURCE SELECTED") {
-        artworkReady = artworkAttempted = false;
-        currentArtworkUrl = "";
+        invalidateArtwork();
         lastArtworkPollAt = millis() - kArtworkPollMs;
       }
       break;
@@ -2672,6 +2790,7 @@ void chooseMenuItem() {
       cancelZoneScan();
       deviceIp = zones[selectedItem].ip;
       applyEndpoint(zones[selectedItem].endpoint);
+      resetSelectedZone();
       settings.putString("device", deviceIp);
       settings.putUChar("chip", uint8_t(activeEndpoint.chip));
       settings.putUShort("port", activeEndpoint.port); settings.putBool("tls", activeEndpoint.tls);
@@ -2747,7 +2866,7 @@ void chooseMenuItem() {
       if (selectedItem == 4) {
         const bool toneOk = readTone();
         const bool bassOk = readVirtualBass();
-        menuMessage = toneOk && bassOk ? "UPDATED" : "READ FAILED";
+        menuMessage = toneOk && (activeEndpoint.chip!=Chip::A31 || bassOk) ? "UPDATED" : "READ FAILED";
         break;
       }
       if (selectedItem == 3) {
@@ -2815,61 +2934,32 @@ void updateDisplaySleep() {
 }
 
 void pollEncoder() {
+  int8_t steps[128];int count=0;
   portENTER_CRITICAL(&encoderMux);
-  if (encoderRead == encoderWrite) { portEXIT_CRITICAL(&encoderMux); return; }
-  int direction = encoderSteps[encoderRead];
-  encoderRead = (encoderRead + 1) & 127;
-  int volumeTarget = constrain(volume + direction*kVolumePerDetent, 0, 100);
-  if (menuScreen == MenuScreen::Player) {
-    // Drain in one snapshot, preserving reversals and clipping at the limits.
-    while (encoderRead != encoderWrite) {
-      volumeTarget = constrain(volumeTarget + encoderSteps[encoderRead]*kVolumePerDetent, 0, 100);
-      encoderRead = (encoderRead + 1) & 127;
-    }
+  while(encoderRead!=encoderWrite && count<128) {
+    steps[count++]=encoderSteps[encoderRead];encoderRead=(encoderRead+1)&127;
   }
   portEXIT_CRITICAL(&encoderMux);
+  if(!count) return;
   recordInteraction();
-  {
-    if (menuScreen == MenuScreen::Scan) return;
-    if (menuScreen == MenuScreen::EqBandEdit) {
-      editingBandValue = constrain(editingBandValue + direction, isCloud() ? -12 : 0, isCloud() ? 12 : 99);
-      toneMessage = ""; drawScreen(); return;
-    }
-    if (menuScreen == MenuScreen::ToneEdit) {
-      editingRaw = constrain(editingRaw + direction, editingTone == 1 ? -5 : 0,
-                             editingTone == 1 ? 5 : 10);
-      toneMessage = "";
-      drawScreen();
-      return;
-    }
-    if (menuScreen == MenuScreen::DeviceInfo || menuScreen == MenuScreen::NetworkInfo ||
-        menuScreen == MenuScreen::MemoryInfo) {
-      selectedItem = constrain(selectedItem + direction, 0, infoLineCount - 1);
-      marqueeStartedAt = marqueeLastAt = millis();
-      marqueeOffset = 0;
-      drawInformation();
-      return;
-    }
-    if (menuScreen != MenuScreen::Player) {
-      selectedItem = constrain(selectedItem + direction, 0, menuCount() - 1);
-      menuMessage = "";
-      marqueeStartedAt = millis();
-      marqueeLastAt = marqueeStartedAt;
-      marqueeOffset = 0;
-      drawMenu();
-      return;
-    }
-    const int next = volumeTarget;
-    if (next != volume) {
-      volume = next;
-      volumeDirty = true;
-      volumeFailures = 0;
-      volumeRetryAt = 0;
-      volumeChangedAt = millis();
-      Serial.printf("Volume test: %d%%\n", volume);
-      drawVolumeUpdate();
-    }
+  if(menuScreen==MenuScreen::Scan) return;
+  int before=0,after=0,minimum=0,maximum=0,scale=1;
+  if(menuScreen==MenuScreen::Player){before=volume;maximum=100;scale=kVolumePerDetent;}
+  else if(menuScreen==MenuScreen::EqBandEdit){before=editingBandValue;minimum=isCloud()?-12:0;maximum=isCloud()?12:99;}
+  else if(menuScreen==MenuScreen::ToneEdit){before=editingRaw;minimum=editingTone==1?-5:0;maximum=editingTone==1?5:10;}
+  else {before=selectedItem;const bool info=menuScreen==MenuScreen::DeviceInfo || menuScreen==MenuScreen::NetworkInfo || menuScreen==MenuScreen::MemoryInfo;
+    maximum=max(0,(info?infoLineCount:menuCount())-1);}
+  after=constrain(before,minimum,maximum);
+  for(int i=0;i<count;++i) after=constrain(after+steps[i]*scale,minimum,maximum);
+  if(after==before) return;
+  if(menuScreen==MenuScreen::Player) {
+    ++controlEpoch;volume=after;volumeDirty=true;volumeFailures=0;volumeRetryAt=0;volumeChangedAt=millis();drawVolumeUpdate();return;
   }
+  if(menuScreen==MenuScreen::EqBandEdit){editingBandValue=after;toneMessage="";drawScreen();return;}
+  if(menuScreen==MenuScreen::ToneEdit){editingRaw=after;toneMessage="";drawScreen();return;}
+  selectedItem=after;menuMessage="";marqueeStartedAt=marqueeLastAt=millis();marqueeOffset=0;
+  if(menuScreen==MenuScreen::DeviceInfo || menuScreen==MenuScreen::NetworkInfo || menuScreen==MenuScreen::MemoryInfo) drawInformation();
+  else drawMenu();
 }
 
 void pollButton() {
@@ -2895,6 +2985,7 @@ void pollButton() {
       } else if (menuScreen != MenuScreen::Player) {
         chooseMenuItem();
       } else {
+        ++controlEpoch;
         presetResume.cancel(); // Manual transport always overrides preset auto-start.
         const bool requestedPlaying = !playing;
         const String command = requestedPlaying ? "setPlayerCmd:resume" : "setPlayerCmd:pause";
@@ -2959,6 +3050,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(kEncoderB), captureEncoder, CHANGE);
   buttonRawPrevious = buttonStable = digitalRead(kButton);
   display.init();
+  initVolumeArcCache();
   display.setBrightness(kNormalBrightness);
   lastInteractionAt = millis();
   drawScreen();
@@ -3005,7 +3097,7 @@ void setup() {
     screenshotServer.begin();
     startSettingsWeb();
     // Keep the settings page and button responsive while the A31 is unreachable.
-    lastPollAt = millis() - kFallbackPollIntervalMs;
+    lastPollAt = millis() - kPollIntervalMs;
     lastGroupPollAt = millis() - kGroupPollMs;
     lastArtworkPollAt = millis();
   } else {
@@ -3013,20 +3105,20 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.16: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.17: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
 
 void loop() {
+  if(!otaActive && !rebootAfterResponse) {pollEncoder();pollButton();sendVolumeWhenReady();serviceBackgroundPoll();}
   if (WiFi.status() == WL_CONNECTED) {pollA98Events();settingsServer.handleClient();}
   if (rebootAfterResponse) { delay(500); ESP.restart(); }
   if (otaActive) { delay(1); return; }
   if (WiFi.status() == WL_CONNECTED && !scanPhase) handleScreenshot();
-  pollEncoder();
-  pollButton();
   if (WiFi.status() == WL_CONNECTED) {
-    if (!scanPhase && ensureA31Tcp()) pollA31Tcp();
+    if (!scanPhase && !volumeDirty && !backgroundPollBusy() && ensureA31Tcp()) pollA31Tcp();
+    else if(a31Tcp.connected()) pollA31Tcp();
   }
   updateDisplaySleep();
   if (feedbackKind && static_cast<int32_t>(millis() - feedbackUntil) >= 0) { feedbackKind = 0; if (menuScreen == MenuScreen::Player) drawScreen(); }
@@ -3066,20 +3158,20 @@ void loop() {
   }
   sendVolumeWhenReady();
   servicePresetResume();
-  if(millis()-lastA31ActivityAt>=800) maintainA98Subscriptions();
-  if (WiFi.status() == WL_CONNECTED && !volumeDirty &&
-      millis() - lastGroupPollAt >= (groupKnown && isSlave ? kSlavePollMs : kGroupPollMs))
-    refreshGroupStatus();
-  if (WiFi.status() == WL_CONNECTED && !volumeDirty &&
-      millis() - lastA31ActivityAt >= 800 &&
-      millis() - lastArtworkPollAt >= kArtworkPollMs) {
-    lastArtworkPollAt = millis();
-    pollArtwork();
-  }
-  if (!volumeDirty && millis() - lastA31ActivityAt >= 800 &&
-      millis() - lastPollAt >= (a31Tcp.connected() ? kPollIntervalMs : kFallbackPollIntervalMs)) {
-    lastPollAt = millis();
-    pollDevice();
+  if(!backgroundPollBusy() && millis()-lastInteractionAt>=800 && millis()-lastA31ActivityAt>=800) maintainA98Subscriptions();
+  const bool quiet=!localVolumePending() && millis()-lastInteractionAt>=800 && millis()-lastA31ActivityAt>=800;
+  if(WiFi.status()==WL_CONNECTED && quiet && !backgroundPollBusy()) {
+    const uint32_t statusInterval=a31Tcp.connected()?kPollIntervalMs:kFallbackPollIntervalMs;
+    if(activeEndpoint.chip==Chip::Unknown) {
+      if(millis()-lastPollAt>=kFallbackPollIntervalMs) {lastPollAt=millis();pollDevice();}
+    } else if(millis()-lastPollAt>=statusInterval) {
+      if(startBackgroundPoll(false)) lastPollAt=millis();
+    } else if(millis()-lastGroupPollAt>=(groupKnown&&isSlave?kSlavePollMs:kGroupPollMs)) {
+      // A33 getStatusEx already contains both playback and group state.
+      if(startBackgroundPoll(!isCloud())) {lastGroupPollAt=millis();if(isCloud())lastPollAt=millis();}
+    } else if(menuScreen==MenuScreen::Player && millis()-lastArtworkPollAt>=kArtworkPollMs) {
+      lastArtworkPollAt=millis();pollArtwork();
+    }
   }
   delay(1);
 }

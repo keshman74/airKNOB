@@ -1,6 +1,6 @@
 from pathlib import Path
 import subprocess
-s=Path('src/main.cpp').read_text();a=s.index('void servicePresetResume()');b=s.index('\nvoid drawVolumeArc()',a)
+s=Path('src/main.cpp').read_text();a=s.index('void servicePresetResume()');b=s.index('\nuint8_t* volumeArcCache',a)
 code=r'''
 #include <string>
 #include <cassert>
@@ -11,7 +11,7 @@ PresetResume presetResume;String deviceIp="zone1",presetResumeZone="zone1";
 bool cloud=true,isSlave=false,volumeDirty=false;const int WL_CONNECTED=1;int wifi=1;
 struct Wifi{int status(){return wifi;}}WiFi;
 struct Log{void println(const char*){}}Serial;
-uint32_t now=100,lastPollAt=0,lastA31ActivityAt=0;const uint32_t kFallbackPollIntervalMs=4000;
+uint32_t now=100,lastPollAt=0,lastA31ActivityAt=0;const uint32_t kFallbackPollIntervalMs=4000,kPollIntervalMs=15000;
 uint32_t millis(){return now;}bool isCloud(){return cloud;}
 int reads=0,sends=0,state=0;bool sendOK=true;int activeEndpoint=0;
 int readA33PresetPlayback(){++reads;return state;}

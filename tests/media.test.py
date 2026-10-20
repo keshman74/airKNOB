@@ -1,11 +1,13 @@
 from pathlib import Path
 import subprocess
 s=Path('src/main.cpp').read_text()
-poll=s[s.index('void pollArtwork() {'):s.index('\nString decodeMetadata')]
+poll=s[s.index('void commitArtworkJob() {'):s.index('void pollArtwork() {')]
 a=s.index('  const bool feedbackActive=');b=s.index('  if (artworkReady)',a);feedback=s[a:b]
 a=s.index('void invalidateArtwork()');b=s.index('int pngLine(',a);updates=s[a:b]
 code=r'''
 #include <string>
+#include <atomic>
+#include <cstring>
 #include <vector>
 #include <cassert>
 #include <cstdint>
@@ -14,7 +16,11 @@ code=r'''
 struct String:std::string{using std::string::string;String(const std::string&s):std::string(s){}String(){}bool isEmpty()const{return empty();}};
 enum class MenuScreen{Player,Zone};MenuScreen menuScreen=MenuScreen::Player;
 const int WL_CONNECTED=1,TFT_WHITE=65535,TFT_BLACK=0;int wifiState=1;struct Wifi{int status(){return wifiState;}} WiFi;
-uint32_t a98ArtworkEpoch=0;
+std::atomic<bool> artworkCancel{false};
+uint16_t artPixels[4]={},nextArtPixels[4]={1,2,3,4};
+struct ArtJob{String title,body;bool ok=false,unchanged=false;}backgroundPoll;
+uint32_t a98ArtworkEpoch=0,zoneEpoch=0;bool otaActive=false,rebootAfterResponse=false;
+enum class Chip{A31,A98};struct Endpoint{Chip chip=Chip::A98;}activeEndpoint;bool localVolumePending(){return false;}
 uint32_t now=10000,lastA31ActivityAt=0,lastArtAttemptAt=0,feedbackUntil=12000;uint32_t millis(){return now;}
 uint32_t marqueeStartedAt=0,marqueeLastAt=0,lastArtworkPollAt=0;int marqueeOffset=0;const uint32_t kArtworkPollMs=20000;
 String currentArtworkUrl="old",lastArtAttemptUrl,offeredUrl,fallbackUrl,reportedArtworkUrl,deviceIp="192.168.0.35",trackTitle="old song",trackArtist="old artist",currentMediaUri="old URI";
@@ -30,17 +36,17 @@ int main(){
  for(const char*s:{"plays","play","playing","1"})assert(playbackState(s)==1);
  for(const char*s:{"pause","paused","stop","stopped","0"})assert(playbackState(s)==0);
  for(const char*s:{"","unknown","buffering","null","2"})assert(playbackState(s)==-1);
- offeredUrl="";pollArtwork();assert(!artworkReady&&currentArtworkUrl.empty()&&downloads==0&&draws==1);
- artworkReady=true;currentArtworkUrl="old";offeredUrl="new";decodeOk=false;pollArtwork();assert(!artworkReady&&currentArtworkUrl.empty()&&draws==2);
- int attempts=downloads;now+=1000;pollArtwork();assert(downloads==attempts&&!artworkReady);
- now+=5000;decodeOk=true;pollArtwork();assert(artworkReady&&currentArtworkUrl=="new"&&draws==3);
- attempts=downloads;now+=30000;pollArtwork();assert(downloads==attempts);
+ backgroundPoll.title=trackTitle;backgroundPoll.body="";commitArtworkJob();assert(!artworkReady&&currentArtworkUrl.empty()&&draws==1);
+ artworkReady=true;currentArtworkUrl="old";backgroundPoll.body="new";backgroundPoll.ok=false;commitArtworkJob();assert(!artworkReady&&currentArtworkUrl.empty());
+ backgroundPoll.ok=true;commitArtworkJob();assert(artworkReady&&currentArtworkUrl=="new"&&artPixels[3]==4);
+ backgroundPoll.body="wrong";backgroundPoll.title="different";commitArtworkJob();assert(currentArtworkUrl=="new");
+ backgroundPoll.title=trackTitle;artworkCancel.store(true);commitArtworkJob();assert(currentArtworkUrl=="new");artworkCancel.store(false);
  assert(updateTrackMetadata("New station","","new URI"));assert(trackArtist.empty()&&!artworkReady&&currentArtworkUrl.empty());
  artworkReady=true;currentArtworkUrl="new";assert(updateTrackMetadata("Another song","","new URI"));assert(artworkReady); // same station/URI, ICY title only
  assert(updateTrackMetadata("Another song","","other URI"));assert(!artworkReady); // URI changes even if title is the same
  trackArtist="old artist";assert(updateTrackMetadata("Another song","","other URI"));assert(trackArtist.empty());
- offeredUrl="new station cover";decodeOk=true;lastArtAttemptUrl="";pollArtwork();assert(artworkReady);
- offeredUrl="";pollArtwork();assert(!artworkReady&&currentArtworkUrl.empty());
+ artworkCancel.store(false);backgroundPoll.title=trackTitle;backgroundPoll.body="new station cover";backgroundPoll.ok=true;commitArtworkJob();assert(artworkReady);
+ backgroundPoll.body="";backgroundPoll.ok=false;commitArtworkJob();assert(!artworkReady&&currentArtworkUrl.empty());
  now=10000;feedbackUntil=12000;
  for(int kind=1;kind<=3;++kind){feedbackKind=kind;maxDrawY=0;drawFeedback();assert(maxDrawY<=62);}
  groupKnown=isSlave=true;for(int kind=1;kind<=2;++kind){feedbackKind=kind;maxDrawY=0;drawFeedback();assert(maxDrawY<=62);}
