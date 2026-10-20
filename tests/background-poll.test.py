@@ -23,9 +23,13 @@ bool isCloud(){return activeEndpoint.chip==Chip::A33;}
 const int pdPASS=1,pdTRUE=1,portMAX_DELAY=0;bool createOK=true;int notifications=0;
 int xTaskCreatePinnedToCore(void(*)(void*),const char*,int,void*,int,TaskHandle_t*handle,int){if(createOK)*handle=(void*)1;return createOK?pdPASS:0;}
 void xTaskNotifyGive(TaskHandle_t){++notifications;}
-struct Done{};int wake=0;void ulTaskNotifyTake(int,int){if(wake++)throw Done{};}
+struct Done{};int wake=0;int ulTaskNotifyTake(int,int){if(wake++)throw Done{};return 1;}
+#define pdMS_TO_TICKS(x) (x)
+struct MockSession{void close(){}}wiimWorkerHttp;
+void runWiiMVolumeJob(){}void commitWiiMVolumeJob(){}
 std::vector<String> calls,ips;String offered=R"({"PlayState":"plays"})",extraOffered=R"({"PlayStatus":"pause"})";bool readOK=true;
 bool readEndpoint(const String&ip,const Endpoint&,const String&cmd,String&body,uint32_t timeout){assert(timeout<=800);ips.push_back(ip);calls.push_back(cmd);body=cmd=="getPlayerStatus"?extraOffered:offered;now+=20;return readOK;}
+bool readWorkerEndpoint(const String&ip,const Endpoint&e,const String&cmd,String&body,uint32_t timeout){return readEndpoint(ip,e,cmd,body,timeout);}
 void runArtworkJob(){}void commitArtworkJob(){}
 int playerResults=0,groupResults=0;String receivedExtra;
 void pollDevice(const String*,bool,const String*extra){++playerResults;receivedExtra=*extra;}

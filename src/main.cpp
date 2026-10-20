@@ -54,7 +54,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.21";
+constexpr char kFirmwareVersion[] = "0.8.22";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -266,7 +266,8 @@ struct BackgroundPoll {
   String ip,command,body,extra,title,reported,currentUrl,lastAttempt;
   Endpoint endpoint;
   uint32_t epoch=0,control=0,artEpoch=0,elapsed=0;
-  bool group=false,ok=false,artwork=false,unchanged=false,hadArtwork=false;
+  bool group=false,ok=false,artwork=false,volumeJob=false,unchanged=false,hadArtwork=false;
+  int volumeTarget=0;
   uint32_t lastAttemptAt=0;
 };
 BackgroundPoll backgroundPoll;
@@ -397,16 +398,37 @@ bool detectEndpoint(const String& ip, Endpoint& endpoint, String& statusBody,
   return false;
 }
 
+#include "wiim_worker_http.h"
+WiiMWorkerHttp wiimWorkerHttp;
+std::atomic<uint32_t> wiimVolumeSends{0},wiimVolumeLastMs{0},wiimVolumeMaxMs{0};
+void runWiiMVolumeJob() {
+  backgroundPoll.ok=false;
+  if(backgroundPoll.epoch!=zoneEpoch.load() || otaActive || rebootAfterResponse) return;
+  const uint32_t started=millis();
+  backgroundPoll.ok=wiimWorkerHttp.read(backgroundPoll.ip,backgroundPoll.endpoint.port,
+      backgroundPoll.epoch,backgroundPoll.command,backgroundPoll.body,800);
+  const uint32_t elapsed=millis()-started;
+  wiimVolumeLastMs.store(elapsed);
+  if(elapsed>wiimVolumeMaxMs.load()) wiimVolumeMaxMs.store(elapsed);
+  wiimVolumeSends.fetch_add(1);
+}
+bool readWorkerEndpoint(const String& ip,const Endpoint& endpoint,const String& command,String& body,uint32_t timeout) {
+  if((endpoint.chip==Chip::A97 || endpoint.chip==Chip::A98) && endpoint.tls)
+    return wiimWorkerHttp.read(ip,endpoint.port,backgroundPoll.epoch,command,body,timeout);
+  wiimWorkerHttp.close();
+  return readEndpoint(ip,endpoint,command,body,timeout);
+}
 void runArtworkJob();
 void backgroundPollWorker(void*) {
   for(;;) {
-    ulTaskNotifyTake(pdTRUE,portMAX_DELAY);
+    if(!ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(1500))) {wiimWorkerHttp.close();continue;}
     if(backgroundPoll.state.load()!=1) continue;
     backgroundPoll.state.store(2);
     const uint32_t started=millis();
     backgroundPoll.extra="";
-    if(backgroundPoll.artwork) {runArtworkJob();backgroundPoll.elapsed=millis()-started;backgroundPoll.state.store(3);continue;}
-    backgroundPoll.ok=readEndpoint(backgroundPoll.ip,backgroundPoll.endpoint,
+    if(backgroundPoll.volumeJob) {runWiiMVolumeJob();backgroundPoll.elapsed=millis()-started;backgroundPoll.state.store(3);continue;}
+    if(backgroundPoll.artwork) {wiimWorkerHttp.close();runArtworkJob();backgroundPoll.elapsed=millis()-started;backgroundPoll.state.store(3);continue;}
+    backgroundPoll.ok=readWorkerEndpoint(backgroundPoll.ip,backgroundPoll.endpoint,
                                   backgroundPoll.command,backgroundPoll.body,800);
     if(backgroundPoll.ok && backgroundPoll.endpoint.chip==Chip::A33 && !backgroundPoll.group) {
       DynamicJsonDocument doc(12288);
@@ -426,7 +448,7 @@ bool startBackgroundPoll(bool group) {
   if(backgroundPollBusy() || activeEndpoint.chip==Chip::Unknown) return false;
   if(!backgroundPollTask && xTaskCreatePinnedToCore(backgroundPollWorker,"player-poll",8192,nullptr,1,&backgroundPollTask,0)!=pdPASS) return false;
   backgroundPoll.ip=deviceIp;backgroundPoll.endpoint=activeEndpoint;backgroundPoll.epoch=zoneEpoch;backgroundPoll.control=controlEpoch;backgroundPoll.artEpoch=a98ArtworkEpoch;
-  backgroundPoll.artwork=false;backgroundPoll.group=group;backgroundPoll.command=group || isCloud()?"getStatusEx":"getPlayerStatus";
+  backgroundPoll.volumeJob=false;backgroundPoll.artwork=false;backgroundPoll.group=group;backgroundPoll.command=group || isCloud()?"getStatusEx":"getPlayerStatus";
   backgroundPoll.body="";backgroundPoll.ok=false;
   backgroundPoll.state.store(1);xTaskNotifyGive(backgroundPollTask);return true;
 }
@@ -878,7 +900,7 @@ bool downloadAndDecodeArtOriginal(String url) {
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
-    http.addHeader("User-Agent","airControl-KNOB/0.8.21");
+    http.addHeader("User-Agent","airControl-KNOB/0.8.22");
     http.addHeader("Accept","image/*,*/*;q=0.8");
     http.addHeader("Accept-Encoding","identity");
     const int status = http.GET();
@@ -1021,7 +1043,7 @@ void pollArtwork() {
   if(!backgroundPollTask && xTaskCreatePinnedToCore(backgroundPollWorker,"player-poll",8192,nullptr,1,&backgroundPollTask,0)!=pdPASS) return;
   backgroundPoll.ip=deviceIp;backgroundPoll.endpoint=activeEndpoint;backgroundPoll.epoch=zoneEpoch;
   backgroundPoll.artEpoch=a98ArtworkEpoch;backgroundPoll.control=controlEpoch;
-  backgroundPoll.artwork=true;backgroundPoll.title=trackTitle;backgroundPoll.reported=reportedArtworkUrl;
+  backgroundPoll.volumeJob=false;backgroundPoll.artwork=true;backgroundPoll.title=trackTitle;backgroundPoll.reported=reportedArtworkUrl;
   backgroundPoll.currentUrl=currentArtworkUrl;backgroundPoll.hadArtwork=artworkReady;
   backgroundPoll.lastAttempt=lastArtAttemptUrl;backgroundPoll.lastAttemptAt=lastArtAttemptAt;
   backgroundPoll.body="";backgroundPoll.extra="";artworkCancel.store(false);
@@ -1270,8 +1292,39 @@ void pollDevice(const String* prefetched=nullptr,bool readOk=true,const String* 
   else if (volumeChanged) drawVolumeUpdate();
 }
 
+// Main-loop ownership: a completed old target never clears a newer encoder target.
+void commitWiiMVolumeJob() {
+  if(backgroundPoll.epoch!=zoneEpoch.load() || backgroundPoll.ip!=deviceIp ||
+     backgroundPoll.endpoint.chip!=activeEndpoint.chip ||
+     backgroundPoll.endpoint.port!=activeEndpoint.port ||
+     backgroundPoll.endpoint.tls!=activeEndpoint.tls || otaActive || rebootAfterResponse) return;
+  lastA31ActivityAt=millis();
+  if(!volumeDirty || backgroundPoll.volumeTarget!=volume) return;
+  if(backgroundPoll.ok) {
+    volumeDirty=false;volumeRetryAt=0;volumeFailures=0;deviceOnline=true;
+  } else {
+    volumeRetryAt=millis()+kVolumeRetryDelayMs;
+    if(++volumeFailures>=3) {volumeDirty=false;volumeFailures=0;}
+    deviceOnline=false;drawScreen();
+  }
+}
+bool startWiiMVolumeJob() {
+  if(backgroundPollBusy() || WiFi.status()!=WL_CONNECTED || otaActive || rebootAfterResponse) return false;
+  if(!backgroundPollTask && xTaskCreatePinnedToCore(backgroundPollWorker,"player-poll",8192,nullptr,1,&backgroundPollTask,0)!=pdPASS) return false;
+  backgroundPoll.ip=deviceIp;backgroundPoll.endpoint=activeEndpoint;backgroundPoll.epoch=zoneEpoch.load();
+  backgroundPoll.control=controlEpoch;backgroundPoll.artEpoch=a98ArtworkEpoch;
+  backgroundPoll.volumeJob=true;backgroundPoll.volumeTarget=volume;
+  backgroundPoll.artwork=false;backgroundPoll.group=false;backgroundPoll.ok=false;
+  backgroundPoll.command="setPlayerCmd:vol:"+String(volume);
+  backgroundPoll.body="";backgroundPoll.extra="";
+  lastVolumeSentAt=millis();
+  backgroundPoll.state.store(1);xTaskNotifyGive(backgroundPollTask);return true;
+}
 void serviceBackgroundPoll() {
   if(backgroundPoll.state.load()!=3) return;
+  if(backgroundPoll.volumeJob) {
+    commitWiiMVolumeJob();backgroundPoll.body="";backgroundPoll.extra="";backgroundPoll.state.store(0);return;
+  }
   if(backgroundPoll.epoch==zoneEpoch && (backgroundPoll.artwork || backgroundPoll.control==controlEpoch) && backgroundPoll.artEpoch==a98ArtworkEpoch && backgroundPoll.ip==deviceIp &&
      backgroundPoll.endpoint.chip==activeEndpoint.chip && !otaActive && !rebootAfterResponse) {
     if(backgroundPoll.artwork) commitArtworkJob();
@@ -1286,6 +1339,13 @@ void serviceBackgroundPoll() {
 void sendVolumeWhenReady() {
   if (!volumeDirty || millis() - lastVolumeSentAt < kVolumeSendDelayMs ||
       static_cast<int32_t>(millis() - volumeRetryAt) < 0) return;
+  if((activeEndpoint.chip==Chip::A97 || activeEndpoint.chip==Chip::A98) && activeEndpoint.tls) {
+    if(millis()-lastVolumeSentAt<120) return; // At most ~8 requests/s while turning.
+    // Cancel artwork cooperatively, then use the single background slot.
+    // While busy, volume stays the one latest target; no FIFO of stale values.
+    if(backgroundPollBusy() && backgroundPoll.artwork) artworkCancel.store(true);
+    startWiiMVolumeJob();return;
+  }
   // Do not block the UI waiting for the A31 TCP command spacing.
   if (activeEndpoint.chip == Chip::A31 && lastTcpSentAt && millis() - lastTcpSentAt < 220) return;
   String body;
@@ -1940,8 +2000,11 @@ void startSettingsWeb() {
   settingsServer.collectHeaders(otaHeaders, 1);
   settingsServer.on("/", HTTP_GET, []() { webPage(); });
   settingsServer.on("/health",HTTP_GET,[](){
-    StaticJsonDocument<1024> doc;
-    doc["background_poll"]=backgroundPoll.state.load();doc["background_job"]=backgroundPoll.artwork?"artwork":"status";doc["zone_epoch"]=zoneEpoch.load();
+    StaticJsonDocument<1536> doc;
+    doc["background_poll"]=backgroundPoll.state.load();doc["background_job"]=backgroundPoll.volumeJob?"volume":backgroundPoll.artwork?"artwork":"status";doc["zone_epoch"]=zoneEpoch.load();
+    doc["wiim_volume_sends"]=wiimVolumeSends.load();doc["wiim_volume_last_ms"]=wiimVolumeLastMs.load();
+    doc["wiim_volume_max_ms"]=wiimVolumeMaxMs.load();
+    doc["wiim_https_requests"]=wiimWorkerHttp.requests.load();doc["wiim_https_reused"]=wiimWorkerHttp.reused.load();
     doc["zone_ip"]=deviceIp;doc["zone_chip"]=chipName(activeEndpoint.chip);
     doc["preset_http"]=presetReadHttp;doc["preset_bytes"]=presetReadBytes;doc["preset_error"]=presetReadError;
     doc["preset_source"]=presetReadSource;doc["preset_port"]=presetReadPort;
@@ -3164,7 +3227,7 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.21: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.22: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }

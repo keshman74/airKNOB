@@ -23,6 +23,7 @@ jobs:
       - run: g++ -std=c++17 -Isrc tests/bounded-http.test.cpp -o /tmp/bounded-http && /tmp/bounded-http
       - run: g++ -std=c++17 -Isrc tests/volume-arc.test.cpp -o /tmp/volume-arc && /tmp/volume-arc
       - run: python3 tests/discovery.test.py
+      - run: python3 tests/wiim-volume.test.py
       - run: python3 tests/worker.test.py
       - run: python3 tests/media.test.py
       - run: python3 tests/capture-bands.test.py
