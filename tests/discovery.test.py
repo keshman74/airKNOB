@@ -1,7 +1,7 @@
 from pathlib import Path
 import subprocess
 source=Path('src/main.cpp').read_text()
-function=source[source.index('bool detectEndpoint('):source.index('\nvoid backgroundPollWorker')]
+function=source[source.index('bool detectEndpoint('):source.index('\n#include "wiim_worker_http.h"')]
 assert 'WiFiClient probe' not in function
 code=r'''
 #include <string>
