@@ -68,7 +68,10 @@ cases=r'''
   assert(devicePresetCount==2&&devicePresets[0].slot==3&&devicePresets[1].slot==12);
  }
  receiveOK=false;offeredHttp=-1;offered="";assert(!loadFixture()&&presetReadHttp==-1&&presetReadBytes==0&&presetReadError=="http_or_body");
- receiveOK=true;offeredHttp=200;offered="broken";assert(!loadFixture()&&presetReadError=="json_parse");
+ receiveOK=true;offeredHttp=200;
+ offered=R"({"preset_list":[)";assert(!loadFixture()&&presetReadError=="json_parse");
+ // Filtered ArduinoJson may classify a non-object token as a structure error.
+ offered="broken";assert(!loadFixture());
  offered=R"({"preset_list":{}})";assert(!loadFixture()&&presetReadError=="json_structure");
  offered=R"({"preset_list":[]})";assert(loadFixture()&&devicePresetCount==0&&presetReadError.empty());
 '''
