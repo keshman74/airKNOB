@@ -54,7 +54,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.22";
+constexpr char kFirmwareVersion[] = "0.8.23";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -399,14 +399,25 @@ bool detectEndpoint(const String& ip, Endpoint& endpoint, String& statusBody,
 }
 
 #include "wiim_worker_http.h"
+#include "a97_volume_soap.h"
 WiiMWorkerHttp wiimWorkerHttp;
+A97VolumeSoap a97VolumeSoap;
+std::atomic<int> wiimVolumePath{0}; // 0 none, 1 HTTPS, 2 UPnP
 std::atomic<uint32_t> wiimVolumeSends{0},wiimVolumeLastMs{0},wiimVolumeMaxMs{0};
 void runWiiMVolumeJob() {
   backgroundPoll.ok=false;
   if(backgroundPoll.epoch!=zoneEpoch.load() || otaActive || rebootAfterResponse) return;
   const uint32_t started=millis();
-  backgroundPoll.ok=wiimWorkerHttp.read(backgroundPoll.ip,backgroundPoll.endpoint.port,
-      backgroundPoll.epoch,backgroundPoll.command,backgroundPoll.body,800);
+  if(backgroundPoll.endpoint.chip==Chip::A97) {
+    wiimWorkerHttp.close(); // Release retained TLS heap before the plain SOAP request.
+    wiimVolumePath.store(2);
+    backgroundPoll.ok=a97VolumeSoap.set(backgroundPoll.ip,backgroundPoll.epoch,backgroundPoll.volumeTarget);
+  }
+  if(!backgroundPoll.ok && backgroundPoll.epoch==zoneEpoch.load() && !otaActive && !rebootAfterResponse) {
+    wiimVolumePath.store(1);
+    backgroundPoll.ok=wiimWorkerHttp.read(backgroundPoll.ip,backgroundPoll.endpoint.port,
+        backgroundPoll.epoch,backgroundPoll.command,backgroundPoll.body,800);
+  }
   const uint32_t elapsed=millis()-started;
   wiimVolumeLastMs.store(elapsed);
   if(elapsed>wiimVolumeMaxMs.load()) wiimVolumeMaxMs.store(elapsed);
@@ -900,7 +911,7 @@ bool downloadAndDecodeArtOriginal(String url) {
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
-    http.addHeader("User-Agent","airControl-KNOB/0.8.22");
+    http.addHeader("User-Agent","airControl-KNOB/0.8.23");
     http.addHeader("Accept","image/*,*/*;q=0.8");
     http.addHeader("Accept-Encoding","identity");
     const int status = http.GET();
@@ -2004,6 +2015,9 @@ void startSettingsWeb() {
     doc["background_poll"]=backgroundPoll.state.load();doc["background_job"]=backgroundPoll.volumeJob?"volume":backgroundPoll.artwork?"artwork":"status";doc["zone_epoch"]=zoneEpoch.load();
     doc["wiim_volume_sends"]=wiimVolumeSends.load();doc["wiim_volume_last_ms"]=wiimVolumeLastMs.load();
     doc["wiim_volume_max_ms"]=wiimVolumeMaxMs.load();
+    doc["wiim_volume_path"]=wiimVolumePath.load()==2?"upnp":wiimVolumePath.load()==1?"https":"none";
+    doc["a97_soap_attempts"]=a97VolumeSoap.attempts.load();doc["a97_soap_ok"]=a97VolumeSoap.successes.load();
+    doc["a97_soap_http"]=a97VolumeSoap.lastHttp.load();
     doc["wiim_https_requests"]=wiimWorkerHttp.requests.load();doc["wiim_https_reused"]=wiimWorkerHttp.reused.load();
     doc["zone_ip"]=deviceIp;doc["zone_chip"]=chipName(activeEndpoint.chip);
     doc["preset_http"]=presetReadHttp;doc["preset_bytes"]=presetReadBytes;doc["preset_error"]=presetReadError;
@@ -3227,7 +3241,7 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.22: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.23: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }

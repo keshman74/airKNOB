@@ -32,9 +32,15 @@ void xTaskNotifyGive(TaskHandle_t){++notifications;}
 bool mcuCommand(const char*){++legacy;return true;}
 bool request(const String&,String&){++legacy;return true;}
 struct Session{
+ void close(){}
  bool ok=true;std::vector<String>commands;
  bool read(const String&,uint16_t,uint32_t,const String&cmd,String&,uint32_t){commands.push_back(cmd);now+=120;return ok;}
 }wiimWorkerHttp;
+struct Soap {
+ bool ok=false;std::vector<int> targets;
+ bool set(const String&,uint32_t,int n){targets.push_back(n);if(ok)now+=15;return ok;}
+}a97VolumeSoap;
+std::atomic<int> wiimVolumePath{0};
 std::atomic<uint32_t> wiimVolumeSends{0},wiimVolumeLastMs{0},wiimVolumeMaxMs{0};
 '''+s[a:b]+s[c:d]+s[e:f]+s[g:h]+r'''
 void finish(){backgroundPoll.state.store(2);runWiiMVolumeJob();backgroundPoll.state.store(3);commitWiiMVolumeJob();backgroundPoll.state.store(0);}
@@ -75,6 +81,14 @@ int main(){
  // A31/A33 retain their existing transport path.
  for(auto chip:{Chip::A31,Chip::A33}){activeEndpoint.chip=chip;now+=200;target(32);sendVolumeWhenReady();assert(!volumeDirty);}
  assert(legacy==2);
+ // A97 SOAP success bypasses HTTPS; A98 stays on its verified HTTPS route.
+ activeEndpoint.chip=Chip::A97;a97VolumeSoap.ok=true;now+=200;
+ auto httpsBefore=wiimWorkerHttp.commands.size();target(38);sendVolumeWhenReady();finish();
+ assert(!volumeDirty&&wiimVolumePath==2&&wiimVolumeLastMs==15);
+ assert(wiimWorkerHttp.commands.size()==httpsBefore&&a97VolumeSoap.targets.back()==38);
+ activeEndpoint.chip=Chip::A98;now+=200;target(40);auto soapBefore=a97VolumeSoap.targets.size();
+ sendVolumeWhenReady();finish();assert(!volumeDirty&&wiimVolumePath==1);
+ assert(a97VolumeSoap.targets.size()==soapBefore&&wiimWorkerHttp.commands.size()==httpsBefore+1);
  std::cout<<"WiiM volume: async dispatch, latest target, stale zone/epoch, failures, retry bounds, artwork cancellation, OTA and legacy transports passed\n";
 }
 '''
