@@ -54,7 +54,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.18";
+constexpr char kFirmwareVersion[] = "0.8.19";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -448,6 +448,9 @@ int devicePresetCount=0;
 String presetZone;
 int presetReadHttp=0;size_t presetReadBytes=0;
 String presetReadError="not_requested";
+bool a98PresetReadPending=false;
+uint32_t a98PresetReadEpoch=0;
+String a98PresetReadIp;
 int selectedPreset = 1;
 String trackTitle;
 String trackArtist;
@@ -696,7 +699,9 @@ bool a98ReadKeyMapping(String& response) {
 
 bool readA98Presets() {
   String mapping;if(!a98ReadKeyMapping(mapping)) return false;
-  a98::Model next;if(!next.mapping(std::string(mapping.c_str()))) {presetReadError="xml_structure";return false;}
+  // Only the UI task calls this loader. Reuse scratch storage rather than
+  // keeping a second 12-key model on the small Arduino loop-task stack.
+  static a98::Model next;if(!next.mapping(std::string(mapping.c_str()))) {presetReadError="xml_structure";return false;}
   bool needsRoutines=false;for(const auto& key:next.keys) if(!key.routine.empty()) needsRoutines=true;
   bool complete=true;
   if(needsRoutines) {
@@ -854,7 +859,7 @@ bool downloadAndDecodeArtOriginal(String url) {
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
-    http.addHeader("User-Agent","airControl-KNOB/0.8.18");
+    http.addHeader("User-Agent","airControl-KNOB/0.8.19");
     http.addHeader("Accept","image/*,*/*;q=0.8");
     http.addHeader("Accept-Encoding","identity");
     const int status = http.GET();
@@ -1922,6 +1927,7 @@ void startSettingsWeb() {
     doc["preset_http"]=presetReadHttp;doc["preset_bytes"]=presetReadBytes;doc["preset_error"]=presetReadError;
     doc["firmware"]=kFirmwareVersion;doc["uptime_s"]=millis()/1000;
     doc["reset_reason"]=int(esp_reset_reason());
+    doc["a98_presets_pending"]=a98PresetReadPending;
     doc["loop_stack_watermark_raw"]=uxTaskGetStackHighWaterMark(nullptr);
     doc["worker_stack_watermark_raw"]=backgroundPollTask?uxTaskGetStackHighWaterMark(backgroundPollTask):0;
     doc["free_heap"]=ESP.getFreeHeap();doc["min_free_heap"]=ESP.getMinFreeHeap();
@@ -2060,6 +2066,29 @@ void startSettingsWeb() {
   settingsServer.begin();
 }
 
+void requestA98PresetRefresh() {
+  if(activeEndpoint.chip!=Chip::A98) return;
+  a98PresetReadPending=true;a98PresetReadEpoch=zoneEpoch;a98PresetReadIp=deviceIp;
+  artworkCancel.store(true);
+  if(presetZone!=deviceIp) devicePresetCount=0;
+  menuMessage="READING";drawMenu();
+}
+void serviceA98PresetRefresh() {
+  if(!a98PresetReadPending) return;
+  if(menuScreen!=MenuScreen::Presets || a98PresetReadEpoch!=zoneEpoch ||
+     a98PresetReadIp!=deviceIp || activeEndpoint.chip!=Chip::A98) {
+    a98PresetReadPending=false;return;
+  }
+  if(otaActive || rebootAfterResponse || scanPhase || localVolumePending() || backgroundPollBusy()) return;
+  // Run after the button call stack has unwound, and only after the worker
+  // response has been drained. No second player/TLS request runs in parallel.
+  const bool ok=readDevicePresets();
+  lastA31ActivityAt=millis();if(!ok) a98MetadataRetry=millis()+30000;
+  a98PresetReadPending=false;selectedItem=0;
+  menuMessage=ok?(devicePresetCount?"":"NO PRESETS"):"READ FAILED";
+  drawMenu();
+}
+
 void setMenu(MenuScreen screen) {
   if (screen == MenuScreen::Zone && zoneCount == 0) {
     zones[0] = ZoneInfo{deviceIp, chipName(activeEndpoint.chip), "", activeEndpoint};
@@ -2072,6 +2101,7 @@ void setMenu(MenuScreen screen) {
   marqueeOffset = 0;
   drawScreen();
   if(screen==MenuScreen::Presets) {
+    if(activeEndpoint.chip==Chip::A98) {requestA98PresetRefresh();return;}
     menuMessage="READING";drawMenu();
     const bool ok=readDevicePresets();
     selectedItem=0;menuMessage=ok ? (devicePresetCount ? "" : "NO PRESETS") : "READ FAILED";
@@ -2680,7 +2710,9 @@ void chooseMenuItem() {
     }
     case MenuScreen::Presets:
       {
+        if(a98PresetReadPending) {menuMessage="READING";drawMenu();return;}
         if(selectedItem==devicePresetCount) {
+          if(activeEndpoint.chip==Chip::A98) {requestA98PresetRefresh();return;}
           menuMessage="READING";drawMenu();
           const bool ok=readDevicePresets();selectedItem=0;
           menuMessage=ok ? (devicePresetCount ? "" : "NO PRESETS") : "READ FAILED";
@@ -3111,13 +3143,13 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.18: multi-chip zones");
+  Serial.println("airControl KNOB v0.8.19: multi-chip zones");
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
 
 void loop() {
-  if(!otaActive && !rebootAfterResponse) {pollEncoder();pollButton();sendVolumeWhenReady();serviceBackgroundPoll();}
+  if(!otaActive && !rebootAfterResponse) {pollEncoder();pollButton();sendVolumeWhenReady();serviceBackgroundPoll();serviceA98PresetRefresh();}
   if (WiFi.status() == WL_CONNECTED) {pollA98Events();settingsServer.handleClient();}
   if (rebootAfterResponse) { delay(500); ESP.restart(); }
   if (otaActive) { delay(1); return; }
@@ -3164,9 +3196,9 @@ void loop() {
   }
   sendVolumeWhenReady();
   servicePresetResume();
-  if(!backgroundPollBusy() && millis()-lastInteractionAt>=800 && millis()-lastA31ActivityAt>=800) maintainA98Subscriptions();
+  if(!a98PresetReadPending && !backgroundPollBusy() && millis()-lastInteractionAt>=800 && millis()-lastA31ActivityAt>=800) maintainA98Subscriptions();
   const bool quiet=!localVolumePending() && millis()-lastInteractionAt>=800 && millis()-lastA31ActivityAt>=800;
-  if(WiFi.status()==WL_CONNECTED && quiet && !backgroundPollBusy()) {
+  if(WiFi.status()==WL_CONNECTED && quiet && !a98PresetReadPending && !backgroundPollBusy()) {
     const uint32_t statusInterval=a31Tcp.connected()?kPollIntervalMs:kFallbackPollIntervalMs;
     if(activeEndpoint.chip==Chip::Unknown) {
       if(millis()-lastPollAt>=kFallbackPollIntervalMs) {lastPollAt=millis();pollDevice();}

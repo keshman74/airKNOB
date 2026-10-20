@@ -30,6 +30,7 @@ jobs:
       - run: g++ -std=c++11 -Isrc tests/art-thumbnail.test.cpp -o /tmp/art-thumbnail && /tmp/art-thumbnail
       - run: python3 tests/xml-media.test.py
       - run: python3 tests/presets.test.py
+      - run: python3 tests/a98-deferred.test.py
       - run: python3 tests/a98-notify.test.py
       - run: python3 tests/a98-subscriptions.test.py
       - run: g++ -std=c++11 -Isrc tests/a98-presets.test.cpp -o /tmp/a98-presets && /tmp/a98-presets
