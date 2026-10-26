@@ -12,6 +12,7 @@ code=mock+r'''
 #include <atomic>
 #include <vector>
 #include <ArduinoJson.h>
+#include "artwork_thumbnail.h"
 void convertFromJson(JsonVariantConst source,String& target){target=source.as<const char*>()?source.as<const char*>():"";}
 bool canConvertFromJson(JsonVariantConst source,const String&){return source.is<const char*>();}
 enum class Chip{A31,A33,A97,A98};struct Endpoint{Chip chip=Chip::A31;bool tls=false;int port=80;};
@@ -35,6 +36,10 @@ int main(){
  reset();backgroundPoll.endpoint.chip=Chip::A33;backgroundPoll.title="new";offered=R"({"title":"old","albumArtURI":"https://old"})";runArtworkJob();assert(downloads.empty()&&!backgroundPoll.ok&&soapReads==0);
  reset();artworkCancel.store(true);runArtworkJob();assert(downloads.empty()&&metaReads==0&&soapReads==0);
  reset();backgroundPoll.endpoint.tls=true;backgroundPoll.endpoint.port=443;assert(jobArtworkUrl("/cover")=="https://192.168.0.35:443/cover");
+ reset();backgroundPoll.endpoint.chip=Chip::A31;backgroundPoll.endpoint.port=80;
+ assert(jobArtworkUrl("/data/airplay_f67a80954965fd2f79a144f41d4bbe38.jpg")=="http://192.168.0.35/data/airplay_f67a80954965fd2f79a144f41d4bbe38.jpg");
+ assert(jobArtworkUrl("https://static.qobuz.com/images/covers/bf/q1/album_600.jpg")=="https://static.qobuz.com/images/covers/bf/q1/album_600.jpg");
+ assert(jobArtworkUrl("http://cdn-profiles.tunein.com/s123/images/logog.png?t=1")=="http://cdn-profiles.tunein.com/s123/images/logog.png?t=1");
  std::cout<<"Actual art worker: A31/A33/A97/A98 resolver, cached cover, retry bounds, no stale A33 art, cancellation and fallback passed\n";
 }
 '''
