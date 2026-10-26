@@ -54,7 +54,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.23";
+constexpr char kFirmwareVersion[] = "0.8.24";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -868,7 +868,9 @@ String cleanMedia(String value) {
 }
 String cleanArtworkUrl(String url) {
   url=decodeXml(cleanMedia(url));
-  if(url.startsWith("/")) url=String(activeEndpoint.tls?"https://":"http://")+deviceIp+":"+String(activeEndpoint.port)+url;
+  if(url.startsWith("/")) url=String(resolveKnobArtworkUrl(std::string(url.c_str()),
+      std::string(deviceIp.c_str()), activeEndpoint.port, activeEndpoint.tls,
+      activeEndpoint.chip==Chip::A31).c_str());
   return url.startsWith("http://") || url.startsWith("https://") ? url : String("");
 }
 int parsePlayback(String value) { value.trim(); value.toLowerCase(); return playbackState(value.c_str()); }
@@ -886,7 +888,14 @@ String fetchSoapArtworkAt(const String& ip,const Endpoint& endpoint) {
   if(raw.isEmpty()) raw=xmlValue(response,"CurrentTrackMetaData");
   if(raw.isEmpty()) raw=xmlValue(response,"AVTransportURIMetaData");
   String metadata=decodeXml(raw),url=decodeXml(xmlValue(metadata,"albumArtURI"));
-  if(url.startsWith("/")) url="http://"+ip+":"+String(port)+url;
+  if(url.startsWith("/") && endpoint.chip==Chip::A31 &&
+     isA31AirPlayArtworkPath(std::string(url.c_str()))) {
+    url=String(resolveKnobArtworkUrl(std::string(url.c_str()), std::string(ip.c_str()),
+        endpoint.port, endpoint.tls, true).c_str());
+  } else if(url.startsWith("/")) {
+    // Preserve the legacy fallback for non-A31 relative UPnP artwork.
+    url="http://"+ip+":"+String(port)+url;
+  }
   return url;
 }
 
@@ -1002,7 +1011,9 @@ bool downloadAndDecodeArt(String url) {
 
 String jobArtworkUrl(String url) {
   url=decodeXml(cleanMedia(url));
-  if(url.startsWith("/")) url=String(backgroundPoll.endpoint.tls?"https://":"http://")+backgroundPoll.ip+":"+String(backgroundPoll.endpoint.port)+url;
+  if(url.startsWith("/")) url=String(resolveKnobArtworkUrl(std::string(url.c_str()),
+      std::string(backgroundPoll.ip.c_str()), backgroundPoll.endpoint.port,
+      backgroundPoll.endpoint.tls, backgroundPoll.endpoint.chip==Chip::A31).c_str());
   return url.startsWith("http://") || url.startsWith("https://")?url:String("");
 }
 void runArtworkJob() {

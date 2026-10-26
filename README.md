@@ -1,4 +1,8 @@
-# airControl KNOB v0.8.17 — current OTA release
+# airControl KNOB v0.8.24 — A31 AirPlay artwork origin fix
+
+A31 AirPlay artwork paths of the exact form `/data/airplay_<32-hex>.jpg` are fetched from the player's normal HTTP origin (port 80). UPnP metadata still uses port 49152; that port is never used for these JPEG requests. TuneIn and Qobuz absolute artwork URLs continue through the existing thumbnail/download path unchanged. The host-side artwork regression test covers the A31 origin and preserves the existing service URLs.
+
+# airControl KNOB v0.8.17 — OTA baseline
 
 Background artwork downloading and status polling keep the UI loop available for encoder input. Encoder events are applied in order and rendered once per batch. Old-zone and superseded-control responses are discarded. Volume arc geometry is cached in PSRAM when available; screenshot rendering retains the 7.5 KB strip buffer.
 
