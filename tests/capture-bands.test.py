@@ -8,6 +8,7 @@ code=r'''
 #include <vector>
 #include <memory>
 #include <cassert>
+#include <cstdint>
 #include <algorithm>
 #include <cmath>
 #include <iostream>
