@@ -2548,7 +2548,7 @@ void discoveryWorker(void*) {
           DynamicJsonDocument info(12288);
           result.ok=!deserializeJson(info,body);
           if(result.ok) {
-            const String name=result.endpoint.chip==Chip::A33 ? String(info["UserDevName"]|info["DevName"]|"A33") : String(info["DeviceName"]|endpointName(result.endpoint));
+            const String name=result.endpoint.chip==Chip::A33 ? String(info["UserDevName"]|info["DevName"]|"A33") : String(info["DeviceName"]|chipName(result.endpoint.chip));
             name.toCharArray(result.name,sizeof(result.name));
             normalizedUuid(String(info["uuid"]|"")).toCharArray(result.uuid,sizeof(result.uuid));
           }
