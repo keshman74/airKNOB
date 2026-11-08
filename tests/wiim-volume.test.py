@@ -11,7 +11,7 @@ code=mock+r'''
 #include <atomic>
 #include <vector>
 enum class Chip{Unknown,A31,A33,A97,A98};
-struct Endpoint{Chip chip=Chip::A97;uint16_t port=443;bool tls=true;};Endpoint activeEndpoint;
+struct Endpoint{Chip chip=Chip::A97;uint16_t port=443;bool tls=true;bool h50Upnp=false;};Endpoint activeEndpoint;
 using TaskHandle_t=void*;
 uint32_t now=10000,controlEpoch=0,a98ArtworkEpoch=0,lastA31ActivityAt=0,lastPollAt=0;
 std::atomic<uint32_t> zoneEpoch{1};
@@ -20,6 +20,8 @@ uint32_t lastVolumeSentAt=0,volumeRetryAt=0,lastTcpSentAt=0;
 String deviceIp="192.168.0.99";
 bool otaActive=false,rebootAfterResponse=false,volumeDirty=true,deviceOnline=false;
 int volume=20,volumeFailures=0,draws=0,legacy=0,notifications=0;
+int h50Calls=0;bool h50Ok=true;
+bool h50ReadEndpoint(const String&,const Endpoint&,const String&,String&,uint32_t){++h50Calls;if(h50Ok)now+=18;return h50Ok;}
 std::atomic<bool> artworkCancel{false};
 uint32_t millis(){return now;}
 void drawScreen(){++draws;}
@@ -86,6 +88,11 @@ int main(){
  auto httpsBefore=wiimWorkerHttp.commands.size();target(38);sendVolumeWhenReady();finish();
  assert(!volumeDirty&&wiimVolumePath==2&&wiimVolumeLastMs==15);
  assert(wiimWorkerHttp.commands.size()==httpsBefore&&a97VolumeSoap.targets.back()==38);
+ activeEndpoint.h50Upnp=true;now+=200;target(39);auto h50Before=h50Calls;
+ auto soapBeforeH50=a97VolumeSoap.targets.size();sendVolumeWhenReady();finish();
+ assert(!volumeDirty&&wiimVolumePath==2&&wiimVolumeLastMs==18&&h50Calls==h50Before+1);
+ assert(wiimWorkerHttp.commands.size()==httpsBefore&&a97VolumeSoap.targets.size()==soapBeforeH50);
+ activeEndpoint.h50Upnp=false;
  activeEndpoint.chip=Chip::A98;now+=200;target(40);auto soapBefore=a97VolumeSoap.targets.size();
  sendVolumeWhenReady();finish();assert(!volumeDirty&&wiimVolumePath==1);
  assert(a97VolumeSoap.targets.size()==soapBefore&&wiimWorkerHttp.commands.size()==httpsBefore+1);
@@ -147,3 +154,4 @@ int main(){
 Path('/tmp/knob_wiim_session.cpp').write_text(session)
 subprocess.run(['g++','-std=c++17','-Isrc','/tmp/knob_wiim_session.cpp','-o','/tmp/knob_wiim_session'],check=True)
 subprocess.run(['/tmp/knob_wiim_session'],check=True)
+

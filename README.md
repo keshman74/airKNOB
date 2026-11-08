@@ -1,4 +1,10 @@
-# airControl KNOB v0.8.24 — A31 AirPlay artwork origin fix
+# airControl KNOB v0.8.25 — H50/A97 HTTP UPnP support
+
+H50 zones are discovered from SSDP LOCATION and validated against the UPnP device description plus `GetControlDeviceInfo`. The H50 profile uses its cleartext HTTP UPnP services on the discovered 49152/59152 endpoints for status, volume and mute. Play follows the captured H50 route on 59152 with `ControlSource=WiiMApp` and keep-alive; USB/Bluetooth and verified tone controls use the H50 TCP/8899 channel. KNOB labels this endpoint H50/A97 and remembers the profile across reboot. Other A97/A98 endpoints keep their existing HTTPS route.
+
+H50 `GetKeyMapping` may report an empty key map; KNOB shows no invented presets. Virtual Bass writes and EQ preset writes remain unavailable until verified on H50 hardware. Firmware builds in CI; KNOB-on-H50 hardware validation for this firmware version remains outstanding.
+
+# airControl KNOB v0.8.17 — OTA baseline
 
 A31 AirPlay artwork paths of the exact form `/data/airplay_<32-hex>.jpg` are fetched from the player's normal HTTP origin (port 80). UPnP metadata still uses port 49152; that port is never used for these JPEG requests. TuneIn and Qobuz absolute artwork URLs continue through the existing thumbnail/download path unchanged. The host-side artwork regression test covers the A31 origin and preserves the existing service URLs.
 

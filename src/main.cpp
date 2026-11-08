@@ -54,7 +54,7 @@ constexpr size_t kMaxArtworkBytes = 350 * 1024;
 constexpr uint32_t kArtworkPollMs = 20000;
 constexpr uint32_t kGroupPollMs = 15000;
 constexpr uint32_t kSlavePollMs = 8000;
-constexpr char kFirmwareVersion[] = "0.8.24";
+constexpr char kFirmwareVersion[] = "0.8.25";
 
 class KnobDisplay : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -255,7 +255,21 @@ int editingRaw = 0;
 String toneMessage;
 bool mcuCommand(const String& payload, String* reply = nullptr);
 enum class Chip : uint8_t { Unknown, A31, A97, A98, A33, Linkplay };
-struct Endpoint { Chip chip = Chip::Unknown; uint16_t port = 80; bool tls = false; };
+// H50 is still an A97-family device. Keep its cleartext UPnP transport as an
+// endpoint capability so ordinary A97 devices continue using HTTPS.
+struct Endpoint {
+  Chip chip = Chip::Unknown;
+  uint16_t port = 80;
+  bool tls = false;
+  bool h50Upnp = false;
+  uint16_t h50PlayPort = 59152;
+  char h50RenderPath[96] = "/upnp/control/rendercontrol1";
+  char h50TransportPath[96] = "/upnp/control/rendertransport1";
+  char h50PlayTransportPath[96] = "/upnp/control/rendertransport1";
+  char h50QueuePath[96] = "/upnp/control/PlayQueue1";
+};
+bool h50ReadEndpoint(const String& ip,const Endpoint& endpoint,const String& command,String& response,uint32_t timeoutMs);
+bool detectH50Endpoint(const String& ip,Endpoint& endpoint,String& statusBody,uint32_t timeoutMs,uint32_t generation);
 Endpoint activeEndpoint;
 std::atomic<uint32_t> zoneEpoch{0};
 uint32_t controlEpoch=0;
@@ -297,6 +311,9 @@ const char* chipName(Chip chip) {
   switch (chip) { case Chip::A31: return "A31"; case Chip::A97: return "A97";
     case Chip::A98: return "A98"; case Chip::A33: return "A33"; case Chip::Linkplay: return "LINKPLAY"; default: return "UNKNOWN"; }
 }
+const char* endpointName(const Endpoint& endpoint) {
+  return endpoint.h50Upnp ? "H50/A97" : chipName(endpoint.chip);
+}
 bool isCloud() { return activeEndpoint.chip == Chip::A33; }
 void applyEndpoint(const Endpoint& endpoint) {
   if(a98Zone.length() && (a98Zone!=deviceIp || endpoint.chip!=Chip::A98)) resetA98State();
@@ -331,6 +348,11 @@ String encodeCommand(const String& value) {
 bool readEndpoint(const String& ip, const Endpoint& endpoint, const String& command,
                   String& response, uint32_t timeoutMs = 1200, int* responseStatus = nullptr) {
   if(responseStatus) *responseStatus=0;
+  if(endpoint.h50Upnp) {
+    const bool ok=h50ReadEndpoint(ip,endpoint,command,response,timeoutMs);
+    if(responseStatus) *responseStatus=ok?200:0;
+    return ok;
+  }
   IPAddress address;
   if (WiFi.status() != WL_CONNECTED || !address.fromString(ip)) return false;
   WiFiClient plain;
@@ -367,6 +389,9 @@ bool detectEndpoint(const String& ip, Endpoint& endpoint, String& statusBody,
                     uint16_t preferredPort = 0, uint32_t statusTimeoutMs = 1600, uint32_t generation = 0) {
   uint16_t ports[] = {80, 8000, 443, 8443};
   IPAddress address; if (!address.fromString(ip)) return false;
+  if((preferredPort==49152 || preferredPort==59152) &&
+     (!generation || discoveryEpochValid(generation)) &&
+     detectH50Endpoint(ip,endpoint,statusBody,statusTimeoutMs,generation)) return true;
   if (preferredPort) for (int i = 0; i < 4; ++i) if (ports[i] == preferredPort) {
     const uint16_t first = ports[0]; ports[0] = ports[i]; ports[i] = first; break;
   }
@@ -395,6 +420,11 @@ bool detectEndpoint(const String& ip, Endpoint& endpoint, String& statusBody,
       endpoint = candidate; statusBody = body; return true;
     }
   }
+  // H50's useful API is exposed through the SSDP-advertised cleartext UPnP
+  // ports, not the Linkplay HTTP API ports above. Only candidates that enter
+  // the bounded validation ledger (SSDP/cache/open API port) reach this path.
+  if(!generation || discoveryEpochValid(generation))
+    if(detectH50Endpoint(ip,endpoint,statusBody,statusTimeoutMs,generation)) return true;
   return false;
 }
 
@@ -408,12 +438,17 @@ void runWiiMVolumeJob() {
   backgroundPoll.ok=false;
   if(backgroundPoll.epoch!=zoneEpoch.load() || otaActive || rebootAfterResponse) return;
   const uint32_t started=millis();
-  if(backgroundPoll.endpoint.chip==Chip::A97) {
+  if(backgroundPoll.endpoint.h50Upnp) {
+    wiimWorkerHttp.close();
+    wiimVolumePath.store(2);
+    backgroundPoll.ok=h50ReadEndpoint(backgroundPoll.ip,backgroundPoll.endpoint,
+        "setPlayerCmd:vol:"+String(backgroundPoll.volumeTarget),backgroundPoll.body,800);
+  } else if(backgroundPoll.endpoint.chip==Chip::A97) {
     wiimWorkerHttp.close(); // Release retained TLS heap before the plain SOAP request.
     wiimVolumePath.store(2);
     backgroundPoll.ok=a97VolumeSoap.set(backgroundPoll.ip,backgroundPoll.epoch,backgroundPoll.volumeTarget);
   }
-  if(!backgroundPoll.ok && backgroundPoll.epoch==zoneEpoch.load() && !otaActive && !rebootAfterResponse) {
+  if(!backgroundPoll.endpoint.h50Upnp && !backgroundPoll.ok && backgroundPoll.epoch==zoneEpoch.load() && !otaActive && !rebootAfterResponse) {
     wiimVolumePath.store(1);
     backgroundPoll.ok=wiimWorkerHttp.read(backgroundPoll.ip,backgroundPoll.endpoint.port,
         backgroundPoll.epoch,backgroundPoll.command,backgroundPoll.body,800);
@@ -630,7 +665,8 @@ bool parseKeyPresets(const String& response,int slotLimit=20) {
   int maximum=xmlValue(context,"MaxNumber").toInt();
   // MaxNumber describes the device key-map structure, not our array capacity.
   // A31 hardware readback includes MaxNumber=21 and reserved/empty Key0/Key21.
-  if(maximum<1 || maximum>64 || slotLimit<1 || slotLimit>20) return false;
+  if(maximum==0) return true; // H50 advertises an empty preset map.
+  if(maximum<0 || maximum>64 || slotLimit<1 || slotLimit>20) return false;
   for(int slot=1;slot<=std::min(maximum,slotLimit);++slot) {
     char key[8];snprintf(key,sizeof(key),"Key%d",slot);
     const String entry=decodeXml(xmlValue(context,key));
@@ -820,6 +856,7 @@ bool readDevicePresets() {
   devicePresetCount=0;presetZone=deviceIp;
   presetReadHttp=0;presetReadBytes=0;presetReadError="read_failed";
   if(activeEndpoint.chip==Chip::A98) return readA98Presets();
+  if(activeEndpoint.h50Upnp) return readKeyMappingPresets(activeEndpoint.port,12);
   if(activeEndpoint.chip==Chip::A97) {
     // Hardware-confirmed A97 PlayQueue endpoints; commands remain on HTTPS.
     if(readKeyMappingPresets(49152,12)) return true;
@@ -875,10 +912,11 @@ String cleanArtworkUrl(String url) {
 }
 int parsePlayback(String value) { value.trim(); value.toLowerCase(); return playbackState(value.c_str()); }
 String fetchSoapArtworkAt(const String& ip,const Endpoint& endpoint) {
-  const uint16_t port=endpoint.chip==Chip::A98?59152:49152;
+  const uint16_t port=endpoint.h50Upnp?endpoint.port:endpoint.chip==Chip::A98?59152:49152;
   WiFiClient client;HTTPClient http;http.useHTTP10(true);
   http.setConnectTimeout(350);http.setTimeout(800);
-  if(!http.begin(client,"http://"+ip+":"+String(port)+"/upnp/control/rendertransport1")) return "";
+  const String path=endpoint.h50Upnp?String(endpoint.h50TransportPath):String("/upnp/control/rendertransport1");
+  if(!http.begin(client,"http://"+ip+":"+String(port)+path)) return "";
   http.addHeader("Content-Type","text/xml; charset=utf-8");
   http.addHeader("SOAPAction","\"urn:schemas-upnp-org:service:AVTransport:1#GetPositionInfo\"");
   const int status=http.POST("<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:GetPositionInfo xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"><InstanceID>0</InstanceID></u:GetPositionInfo></s:Body></s:Envelope>");
@@ -920,7 +958,7 @@ bool downloadAndDecodeArtOriginal(String url) {
     if (!began) return false;
     const char* headers[] = {"Location"};
     http.collectHeaders(headers, 1);
-    http.addHeader("User-Agent","airControl-KNOB/0.8.23");
+    http.addHeader("User-Agent","airControl-KNOB/0.8.25");
     http.addHeader("Accept","image/*,*/*;q=0.8");
     http.addHeader("Accept-Encoding","identity");
     const int status = http.GET();
@@ -1087,6 +1125,166 @@ String decodeMetadata(const char* value) {
     if (c) output += c;
   }
   return output;
+}
+
+bool h50Soap(const String& ip,const Endpoint& endpoint,const char* controlPath,
+             const char* service,const char* action,const String& arguments,
+             String& response,uint32_t timeoutMs,uint16_t portOverride=0,bool keepAlive=false) {
+  IPAddress address;
+  if(WiFi.status()!=WL_CONNECTED || !address.fromString(ip)) return false;
+  WiFiClient client;HTTPClient http;http.useHTTP10(!keepAlive);
+  http.setConnectTimeout(350);http.setTimeout(timeoutMs);
+  if(!http.begin(client,"http://"+ip+":"+String(portOverride?portOverride:endpoint.port)+controlPath)) return false;
+  http.addHeader("Content-Type","text/xml; charset=utf-8");
+  if(keepAlive) http.addHeader("Connection","keep-alive");
+  http.addHeader("SOAPAction",String("\"")+service+"#"+action+"\"");
+  const String envelope="<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:"+
+      String(action)+" xmlns:u=\""+service+"\">"+arguments+"</u:"+action+"></s:Body></s:Envelope>";
+  const int status=http.POST(envelope);
+  response="";
+  const bool ok=status==200 && readBoundedResponse(http,response,32768,1000) &&
+      xmlValue(response,"Fault").isEmpty();
+  http.end();
+  return ok;
+}
+
+String h50ServicePath(const String& description,const char* serviceName) {
+  int cursor=0;
+  while((cursor=description.indexOf("<service",cursor))>=0) {
+    const int end=description.indexOf("</service>",cursor);
+    if(end<0) return "";
+    const String block=description.substring(cursor,end+10);
+    String type=xmlValue(block,"serviceType");type.toLowerCase();
+    String wanted=serviceName;wanted.toLowerCase();
+    if(type.indexOf(wanted)<0) {cursor=end+10;continue;}
+    String path=decodeXml(xmlValue(block,"controlURL"));path.trim();
+    if(path.startsWith("http://") || path.startsWith("https://")) {
+      const int slash=path.indexOf('/',path.indexOf("://")+3);
+      path=slash<0?String("/"):path.substring(slash);
+    } else if(!path.startsWith("/")) path="/"+path;
+    return path;
+  }
+  return "";
+}
+
+bool detectH50Endpoint(const String& ip,Endpoint& endpoint,String& statusBody,
+                       uint32_t timeoutMs,uint32_t generation) {
+  const uint16_t ports[]={49152,59152};String descriptions[2];bool available[2]={false,false};
+  for(int i=0;i<2;++i) {
+    if(generation && !discoveryEpochValid(generation)) return false;
+    WiFiClient client;HTTPClient http;http.useHTTP10(true);
+    http.setConnectTimeout(300);http.setTimeout(timeoutMs);
+    if(!http.begin(client,"http://"+ip+":"+String(ports[i])+"/description.xml")) continue;
+    const int status=http.GET();
+    available[i]=status==200 && readBoundedResponse(http,descriptions[i],16384,700);
+    http.end();
+  }
+  int base=available[0]?0:available[1]?1:-1;if(base<0) return false;
+  String model=xmlValue(descriptions[base],"modelName");
+  String modelInfo=model+" "+xmlValue(descriptions[base],"modelDescription");modelInfo.toUpperCase();
+  if(modelInfo.indexOf("H50")<0) return false;
+  Endpoint candidate;candidate.chip=Chip::A97;candidate.port=ports[base];candidate.tls=false;candidate.h50Upnp=true;
+  String render=h50ServicePath(descriptions[base],"RenderingControl");
+  String transport=h50ServicePath(descriptions[base],"AVTransport");
+  String queue=h50ServicePath(descriptions[base],"PlayQueue");
+  if(render.isEmpty() || transport.isEmpty()) return false;
+  render.toCharArray(candidate.h50RenderPath,sizeof(candidate.h50RenderPath));
+  transport.toCharArray(candidate.h50TransportPath,sizeof(candidate.h50TransportPath));
+  if(queue.length()) queue.toCharArray(candidate.h50QueuePath,sizeof(candidate.h50QueuePath));
+  // The captured working H50 Play request uses the second advertised UPnP
+  // endpoint. Only enable that action after resolving AVTransport there.
+  if(available[1]) {
+    const String playPath=h50ServicePath(descriptions[1],"AVTransport");
+    if(playPath.length()) playPath.toCharArray(candidate.h50PlayTransportPath,sizeof(candidate.h50PlayTransportPath));
+  } else candidate.h50PlayTransportPath[0]='\0';
+  String info;
+  if(!h50Soap(ip,candidate,candidate.h50RenderPath,
+      "urn:schemas-upnp-org:service:RenderingControl:1","GetControlDeviceInfo",
+      "<InstanceID>0</InstanceID>",info,timeoutMs)) return false;
+  String identity=info;identity.toLowerCase();
+  if(identity.indexOf("arylic_h50")<0 || identity.indexOf("allwinner-r328")<0) return false;
+  DynamicJsonDocument doc(512);
+  doc["DeviceName"]=model.length()?model:"H50";
+  doc["hardware"]="ALLWINNER-R328";doc["project"]="ARYLIC_H50";
+  doc["uuid"]="h50-"+ip;
+  statusBody="";serializeJson(doc,statusBody);
+  endpoint=candidate;return true;
+}
+
+bool h50ReadEndpoint(const String& ip,const Endpoint& endpoint,const String& command,
+                     String& response,uint32_t timeoutMs) {
+  const char* const rc="urn:schemas-upnp-org:service:RenderingControl:1";
+  const char* const avt="urn:schemas-upnp-org:service:AVTransport:1";
+  const String instance="<InstanceID>0</InstanceID>";
+  const String channel="<Channel>Master</Channel>";
+  auto readPosition=[&](String& position) {
+    return h50Soap(ip,endpoint,endpoint.h50TransportPath,avt,"GetPositionInfo",
+        instance,position,timeoutMs);
+  };
+  auto readTransport=[&](String& transport) {
+    return h50Soap(ip,endpoint,endpoint.h50TransportPath,avt,"GetTransportInfo",
+        instance,transport,timeoutMs);
+  };
+  if(command=="getMetaInfo") {
+    String position;if(!readPosition(position)) return false;
+    String value=decodeXml(xmlValue(position,"TrackMetaData"));
+    DynamicJsonDocument doc(2048);JsonObject meta=doc.createNestedObject("metaData");
+    meta["title"]=decodeXml(xmlValue(value,"title"));
+    meta["artist"]=decodeXml(xmlValue(value,"artist"));
+    meta["album"]=decodeXml(xmlValue(value,"album"));
+    meta["albumArtURI"]=decodeXml(xmlValue(value,"albumArtURI"));
+    response="";serializeJson(doc,response);return true;
+  }
+  if(command=="getStatusEx" || command=="getPlayerStatus") {
+    String transport,position,volumeReply,muteReply;
+    if(!readTransport(transport) ||
+       !h50Soap(ip,endpoint,endpoint.h50RenderPath,rc,"GetVolume",
+          instance+channel,volumeReply,timeoutMs) ||
+       !h50Soap(ip,endpoint,endpoint.h50RenderPath,rc,"GetMute",
+          instance+channel,muteReply,timeoutMs) || !readPosition(position)) return false;
+    String state=xmlValue(transport,"CurrentTransportState");state.toUpperCase();
+    const char* playState=state.indexOf("PLAYING")>=0?"play":
+        state.indexOf("PAUSED")>=0?"pause":state.indexOf("STOPPED")>=0?"stop":"";
+    const String volume=xmlValue(volumeReply,"CurrentVolume");
+    const String mute=xmlValue(muteReply,"CurrentMute");
+    String didl=decodeXml(xmlValue(position,"TrackMetaData"));
+    const String title=decodeXml(xmlValue(didl,"title"));
+    const String artist=decodeXml(xmlValue(didl,"artist"));
+    const String album=decodeXml(xmlValue(didl,"album"));
+    const String art=decodeXml(xmlValue(didl,"albumArtURI"));
+    DynamicJsonDocument doc(3072);
+    doc["status"]=playState;doc["vol"]=volume;doc["mute"]=mute;
+    doc["Title"]=title;doc["Artist"]=artist;doc["Album"]=album;
+    doc["uri"]=decodeXml(xmlValue(position,"TrackURI"));
+    if(command=="getStatusEx") {
+      doc["DeviceName"]="H50";doc["hardware"]="ALLWINNER-R328";
+      doc["project"]="ARYLIC_H50";doc["uuid"]="h50-"+ip;
+      doc["group"]="0";doc["master_ip"]="0";
+    }
+    response="";serializeJson(doc,response);return true;
+  }
+  const String volPrefix="setPlayerCmd:vol:";
+  if(command.startsWith(volPrefix)) {
+    const int value=command.substring(volPrefix.length()).toInt();
+    if(value<0 || value>100) return false;
+    return h50Soap(ip,endpoint,endpoint.h50RenderPath,rc,"SetVolume",
+      instance+channel+"<DesiredVolume>"+String(value)+"</DesiredVolume>",response,timeoutMs);
+  }
+  const String mutePrefix="setPlayerCmd:mute:";
+  if(command.startsWith(mutePrefix)) {
+    const int value=command.substring(mutePrefix.length()).toInt();
+    if(value<0 || value>1) return false;
+    return h50Soap(ip,endpoint,endpoint.h50RenderPath,rc,"SetMute",
+      instance+channel+"<DesiredMute>"+String(value)+"</DesiredMute>",response,timeoutMs);
+  }
+  if(command=="setPlayerCmd:resume")
+    return endpoint.h50PlayTransportPath[0] && h50Soap(ip,endpoint,endpoint.h50PlayTransportPath,avt,"Play",
+        instance+"<Speed>1</Speed><ControlSource>WiiMApp</ControlSource>",
+        response,timeoutMs,endpoint.h50PlayPort,true);
+  if(command=="setPlayerCmd:pause")
+    return h50Soap(ip,endpoint,endpoint.h50TransportPath,avt,"Pause",
+        instance,response,timeoutMs);
+  return false;
 }
 
 uint32_t nextCodepoint(const String& value, size_t& offset) {
@@ -1319,7 +1517,8 @@ void commitWiiMVolumeJob() {
   if(backgroundPoll.epoch!=zoneEpoch.load() || backgroundPoll.ip!=deviceIp ||
      backgroundPoll.endpoint.chip!=activeEndpoint.chip ||
      backgroundPoll.endpoint.port!=activeEndpoint.port ||
-     backgroundPoll.endpoint.tls!=activeEndpoint.tls || otaActive || rebootAfterResponse) return;
+     backgroundPoll.endpoint.tls!=activeEndpoint.tls ||
+     backgroundPoll.endpoint.h50Upnp!=activeEndpoint.h50Upnp || otaActive || rebootAfterResponse) return;
   lastA31ActivityAt=millis();
   if(!volumeDirty || backgroundPoll.volumeTarget!=volume) return;
   if(backgroundPoll.ok) {
@@ -1361,7 +1560,8 @@ void serviceBackgroundPoll() {
 void sendVolumeWhenReady() {
   if (!volumeDirty || millis() - lastVolumeSentAt < kVolumeSendDelayMs ||
       static_cast<int32_t>(millis() - volumeRetryAt) < 0) return;
-  if((activeEndpoint.chip==Chip::A97 || activeEndpoint.chip==Chip::A98) && activeEndpoint.tls) {
+  if(activeEndpoint.h50Upnp ||
+     ((activeEndpoint.chip==Chip::A97 || activeEndpoint.chip==Chip::A98) && activeEndpoint.tls)) {
     if(millis()-lastVolumeSentAt<120) return; // At most ~8 requests/s while turning.
     // Cancel artwork cooperatively, then use the single background slot.
     // While busy, volume stays the one latest target; no FIFO of stale values.
@@ -1595,6 +1795,7 @@ const char* const kSourceItems[] = {
     "Network", "Bluetooth", "AUX In", "USB Disk", "Optical In", "RCA 2 In", "USB DAC"};
 const char* const kSourceModes[] = {
     "wifi", "bluetooth", "line-in", "udisk", "optical", "line-in2", "PCUSB"};
+const char* const kH50SourceItems[] = {"USB Disk", "Bluetooth"};
 const char* const kEqItems[] = {"Flat", "Classical", "Pop", "Jazz", "Rock", "Vocal"};
 const char* const kMultiroomItems[] = {
     "Add to group", "Leave group", "Group status", "Find zones"};
@@ -1609,7 +1810,7 @@ int menuCount() {
   switch (menuScreen) {
     case MenuScreen::Home: return 5;
     case MenuScreen::Presets: return devicePresetCount + 1;
-    case MenuScreen::Source: return sourceCapabilitiesKnown ? discoveredSourceCount : activeEndpoint.chip == Chip::A31 ? 7 : isCloud() ? 5 : 3;
+    case MenuScreen::Source: return sourceCapabilitiesKnown ? discoveredSourceCount : activeEndpoint.h50Upnp ? 2 : activeEndpoint.chip == Chip::A31 ? 7 : isCloud() ? 5 : 3;
     case MenuScreen::EqBands: return 12;
     case MenuScreen::Multiroom: return 4;
     case MenuScreen::Join: return max(1, zoneCount - 1);
@@ -1627,7 +1828,7 @@ String menuLabel(int item) {
   switch (menuScreen) {
     case MenuScreen::Home: return kHomeItems[item];
     case MenuScreen::Presets: return item==devicePresetCount ? String("Refresh") : String(devicePresets[item].slot)+(activeEndpoint.chip==Chip::A98 && a98Model.active==devicePresets[item].slot ? " * " : " ")+devicePresets[item].name;
-    case MenuScreen::Source: return sourceCapabilitiesKnown ? discoveredSourceNames[item] : isCloud() && item == 4 ? "HDMI ARC" : kSourceItems[item];
+    case MenuScreen::Source: return sourceCapabilitiesKnown ? discoveredSourceNames[item] : activeEndpoint.h50Upnp ? kH50SourceItems[item] : isCloud() && item == 4 ? "HDMI ARC" : kSourceItems[item];
     case MenuScreen::Multiroom: return kMultiroomItems[item];
     case MenuScreen::Join: {
       const int i = joinZoneIndex(item);
@@ -1635,7 +1836,7 @@ String menuLabel(int item) {
     }
     case MenuScreen::Zone:
       return item < zoneCount ?
-          String(zones[item].ip == deviceIp ? "* " : "") + zones[item].name + " " + chipName(zones[item].endpoint.chip) + " " +
+          String(zones[item].ip == deviceIp ? "* " : "") + zones[item].name + " " + endpointName(zones[item].endpoint) + " " +
               zones[item].ip.substring(zones[item].ip.lastIndexOf('.') + 1) :
           String("Find zones");
     case MenuScreen::Settings:
@@ -2030,7 +2231,7 @@ void startSettingsWeb() {
     doc["a97_soap_attempts"]=a97VolumeSoap.attempts.load();doc["a97_soap_ok"]=a97VolumeSoap.successes.load();
     doc["a97_soap_http"]=a97VolumeSoap.lastHttp.load();
     doc["wiim_https_requests"]=wiimWorkerHttp.requests.load();doc["wiim_https_reused"]=wiimWorkerHttp.reused.load();
-    doc["zone_ip"]=deviceIp;doc["zone_chip"]=chipName(activeEndpoint.chip);
+    doc["zone_ip"]=deviceIp;doc["zone_chip"]=endpointName(activeEndpoint);
     doc["preset_http"]=presetReadHttp;doc["preset_bytes"]=presetReadBytes;doc["preset_error"]=presetReadError;
     doc["preset_source"]=presetReadSource;doc["preset_port"]=presetReadPort;
     doc["firmware"]=kFirmwareVersion;doc["uptime_s"]=millis()/1000;
@@ -2057,7 +2258,8 @@ void startSettingsWeb() {
       JsonObject zone = list.createNestedObject();
       zone["name"] = zones[i].name;
       zone["ip"] = zones[i].ip;
-      zone["chip"] = chipName(zones[i].endpoint.chip);
+      zone["chip"] = endpointName(zones[i].endpoint);
+      if(zones[i].endpoint.h50Upnp) zone["profile"]="A97 H50 UPnP/HTTP";
       zone["protocol"] = zones[i].endpoint.tls ? "https" : "http";
       zone["port"] = zones[i].endpoint.port;
     }
@@ -2082,6 +2284,12 @@ void startSettingsWeb() {
     settings.putUChar("chip", uint8_t(activeEndpoint.chip));
     settings.putUShort("port", activeEndpoint.port);
     settings.putBool("tls", activeEndpoint.tls);
+    settings.putBool("h50",activeEndpoint.h50Upnp);
+    settings.putString("h50_rc",activeEndpoint.h50RenderPath);
+    settings.putString("h50_avt",activeEndpoint.h50TransportPath);
+    settings.putString("h50_play_avt",activeEndpoint.h50PlayTransportPath);
+    settings.putUShort("h50_play_port",activeEndpoint.h50PlayPort);
+    settings.putString("h50_pq",activeEndpoint.h50QueuePath);
     a31Tcp.stop(); tcpInputLength = 0; lastTcpAttemptAt = 0;
     groupKnown = isSlave = deviceOnline = volumeDirty = false;
     masterIp = groupValue = trackTitle = trackArtist = currentArtworkUrl = "";
@@ -2252,10 +2460,10 @@ void rememberZone(const String& ip, uint16_t preferredPort = 0) {
   if (index < 0) index = zoneCount++;
   ZoneInfo& zone = zones[index];
   zone.ip = ip; zone.endpoint = endpoint;
-  zone.name = endpoint.chip == Chip::A33 ? String(info["UserDevName"] | info["DevName"] | "A33") : String(info["DeviceName"] | chipName(endpoint.chip));
+  zone.name = endpoint.chip == Chip::A33 ? String(info["UserDevName"] | info["DevName"] | "A33") : String(info["DeviceName"] | endpointName(endpoint));
   zone.uuid = normalizedUuid(String(info["uuid"] | ""));
-  if (ip == deviceIp) { if (activeEndpoint.chip != endpoint.chip || activeEndpoint.port != endpoint.port) applyEndpoint(endpoint); readSourceCapabilities(info.as<JsonVariantConst>()); }
-  Serial.printf("Zone: %s %s %s:%u\n", zone.name.c_str(), chipName(endpoint.chip), ip.c_str(), endpoint.port);
+  if (ip == deviceIp) { if (activeEndpoint.chip != endpoint.chip || activeEndpoint.port != endpoint.port || activeEndpoint.h50Upnp != endpoint.h50Upnp) applyEndpoint(endpoint); readSourceCapabilities(info.as<JsonVariantConst>()); }
+  Serial.printf("Zone: %s %s %s:%u\n", zone.name.c_str(), endpointName(endpoint), ip.c_str(), endpoint.port);
 }
 
 String ssdpLocationIp(const String& packet) {
@@ -2271,6 +2479,18 @@ String ssdpLocationIp(const String& packet) {
   for (int i=start;i<int(url.length());++i) if (url[i]==':' || url[i]=='/') { hostEnd=i; break; }
   String host = url.substring(start,hostEnd); IPAddress ip;
   return ip.fromString(host) ? host : String("");
+}
+uint16_t ssdpLocationPort(const String& packet) {
+  String lower=packet;lower.toLowerCase();int at=lower.indexOf("\nlocation:");
+  if(at<0) return 0;at+=10;int end=packet.indexOf('\n',at);
+  String url=packet.substring(at,end<0?packet.length():end);url.trim();
+  if(!url.startsWith("http://") && !url.startsWith("https://")) return 0;
+  const int start=url.indexOf("://")+3;const int slash=url.indexOf('/',start);
+  const int colon=url.indexOf(':',start);
+  if(colon<0 || (slash>=0 && colon>slash)) return 0;
+  const int stop=slash<0?url.length():slash;
+  const int port=url.substring(colon+1,stop).toInt();
+  return port>0 && port<=65535?uint16_t(port):0;
 }
 struct DiscoveryJob { uint32_t generation; uint8_t host; uint16_t port; };
 struct DiscoveryResult {
@@ -2328,7 +2548,7 @@ void discoveryWorker(void*) {
           DynamicJsonDocument info(12288);
           result.ok=!deserializeJson(info,body);
           if(result.ok) {
-            const String name=result.endpoint.chip==Chip::A33 ? String(info["UserDevName"]|info["DevName"]|"A33") : String(info["DeviceName"]|chipName(result.endpoint.chip));
+            const String name=result.endpoint.chip==Chip::A33 ? String(info["UserDevName"]|info["DevName"]|"A33") : String(info["DeviceName"]|endpointName(result.endpoint));
             name.toCharArray(result.name,sizeof(result.name));
             normalizedUuid(String(info["uuid"]|"")).toCharArray(result.uuid,sizeof(result.uuid));
           }
@@ -2388,20 +2608,23 @@ void queueDiscoveryCandidate(const String& ip,uint16_t port=0) {
   DiscoveryJob job{discoveryGeneration.load(),address[3],port};
   xQueueSend(discoveryJobs,&job,0);
 }
-void rememberSsdpCandidate(const String& ip) {
+void rememberSsdpCandidate(const String& ip,uint16_t port=0) {
   if(!localIp(ip)) return;
   for(int i=0;i<ssdpSeenCount;++i) if(ssdpSeen[i]==ip) return;
   if(ssdpSeenCount>=64) return;
   IPAddress address; if(!address.fromString(ip)) return;
-  DiscoveryJob job{discoveryGeneration.load(),address[3],0};
+  DiscoveryJob job{discoveryGeneration.load(),address[3],port};
   if(xQueueSend(discoveryJobs,&job,0)==pdTRUE) ssdpSeen[ssdpSeenCount++]=ip;
 }
 void collectSsdpCandidates(WiFiUDP& udp,int budget) {
   while(budget-- >0 && udp.parsePacket()>0) {
     const String sender=udp.remoteIP().toString(); String packet; packet.reserve(1536);
     while(udp.available()) { const char c=char(udp.read()); if(packet.length()<1536) packet+=c; }
-    rememberSsdpCandidate(sender);
-    const String location=ssdpLocationIp(packet); if(location.length() && location!=sender) rememberSsdpCandidate(location);
+    const String location=ssdpLocationIp(packet);
+    if(location.length()) {
+      rememberSsdpCandidate(location,ssdpLocationPort(packet));
+      if(location!=sender) rememberSsdpCandidate(sender);
+    } else rememberSsdpCandidate(sender);
   }
 }
 void sendDiscoveryBurst() {
@@ -2457,8 +2680,8 @@ void pollZoneScan() {
     for(int i=0;i<zoneCount;++i) if(zones[i].ip==ip) index=i;
     if(index<0) { if(zoneCount>=kMaxZones) continue; index=zoneCount++; }
     zones[index]=ZoneInfo{ip,String(result.name),String(result.uuid),result.endpoint}; changed=true;
-    if(ip==deviceIp && (activeEndpoint.chip!=result.endpoint.chip || activeEndpoint.port!=result.endpoint.port || activeEndpoint.tls!=result.endpoint.tls)) applyEndpoint(result.endpoint);
-    Serial.printf("Zone verified: %s %s %s:%u\n",result.name,chipName(result.endpoint.chip),ip.c_str(),result.endpoint.port);
+    if(ip==deviceIp && (activeEndpoint.chip!=result.endpoint.chip || activeEndpoint.port!=result.endpoint.port || activeEndpoint.tls!=result.endpoint.tls || activeEndpoint.h50Upnp!=result.endpoint.h50Upnp)) applyEndpoint(result.endpoint);
+    Serial.printf("Zone verified: %s %s %s:%u\n",result.name,endpointName(result.endpoint),ip.c_str(),result.endpoint.port);
   }
   scanHost=discoveryProgress.load()+1;
   if(changed || millis()-discoveryUiAt>=500) {
@@ -2479,7 +2702,7 @@ bool openInformation(MenuScreen screen) {
   infoLineCount = 5;
   if (screen == MenuScreen::DeviceInfo) {
     infoLines[0] = "NAME " + (isCloud() ? String(doc["UserDevName"] | doc["DevName"] | "A33") : String(doc["DeviceName"] | "?"));
-    infoLines[1] = "CHIP " + String(chipName(activeEndpoint.chip));
+    infoLines[1] = "CHIP " + String(endpointName(activeEndpoint));
     infoLines[2] = "FW " + (isCloud() ? String(doc["VERSION"] | "?") : String(doc["firmware"] | "?"));
     infoLines[3] = "PROJECT " + (isCloud() ? String(doc["ProjectName"] | "?") : String(doc["project"] | "?"));
     infoLines[4] = "IP " + deviceIp;
@@ -2495,6 +2718,7 @@ bool openInformation(MenuScreen screen) {
 }
 
 bool sendA31EqPreset(int index) {
+  if(activeEndpoint.h50Upnp) return false; // H50 preset-EQ writes are not verified.
   if (activeEndpoint.chip == Chip::A98 || activeEndpoint.chip == Chip::A97) {
     const char* names[] = {"Flat", "Classical", "Pop", "Jazz", "Rock", "Vocal Booster"};
     String body; return request("EQLoad:" + String(names[index]), body);
@@ -2552,7 +2776,7 @@ void handleTcpMessage(const String& message) {
 }
 
 bool ensureA31Tcp() {
-  if (activeEndpoint.chip != Chip::A31 && activeEndpoint.chip != Chip::A33) return false;
+  if (activeEndpoint.chip != Chip::A31 && activeEndpoint.chip != Chip::A33 && !activeEndpoint.h50Upnp) return false;
   if (WiFi.status() != WL_CONNECTED) return false;
   if (a31TcpIp != deviceIp) {
     a31Tcp.stop();
@@ -2656,7 +2880,7 @@ bool mcuCommand(const String& payload, String* reply) {
     if(!sent) a31Tcp.stop();
     return sent;
   }
-  if (activeEndpoint.chip != Chip::A31) return false;
+  if (activeEndpoint.chip != Chip::A31 && !activeEndpoint.h50Upnp) return false;
   if (!ensureA31Tcp()) return false;
   pollA31Tcp(); // Discard old replies before issuing a new request.
   if (lastTcpSentAt && millis() - lastTcpSentAt < 220)
@@ -2717,7 +2941,7 @@ bool readTone() {
     toneRaw[0] = data["Bass"].as<int>() + 5; toneRaw[2] = data["Treble"].as<int>() + 5;
     return toneKnown[0] && toneKnown[2];
   }
-  if (activeEndpoint.chip != Chip::A31) return false;
+  if (activeEndpoint.chip != Chip::A31 && !activeEndpoint.h50Upnp) return false;
   String eq, mid;
   const bool eqOk = mcuCommand("MCU+PAS+EQGet&", &eq);
   const bool midOk = mcuCommand("MCU+PAS+RAKOIT:MID&", &mid);
@@ -2728,7 +2952,7 @@ bool readTone() {
 }
 
 bool readVirtualBass() {
-  if (activeEndpoint.chip != Chip::A31) { virtualBassKnown = false; return false; }
+  if (activeEndpoint.chip != Chip::A31 && !activeEndpoint.h50Upnp) { virtualBassKnown = false; return false; }
   String reply;
   int value = 0;
   virtualBassKnown = mcuCommand("MCU+PAS+RAKOIT:VBS&", &reply) &&
@@ -2738,6 +2962,7 @@ bool readVirtualBass() {
 }
 
 bool writeVirtualBass() {
+  if(activeEndpoint.h50Upnp) return false; // H50 VBS writes have not been verified.
   const bool desired = !virtualBassEnabled;
   if (!mcuCommand("MCU+PAS+RAKOIT:VBS:" + String(desired ? 1 : 0) + "&"))
     return false;
@@ -2864,7 +3089,9 @@ void chooseMenuItem() {
       break;
     case MenuScreen::Source:
       presetResume.cancel();
-      menuMessage = request("setPlayerCmd:switchmode:" + (sourceCapabilitiesKnown ? discoveredSourceModes[selectedItem] : isCloud() ? (selectedItem == 4 ? String("HDMI ARC") : String(kSourceItems[selectedItem])) : String(kSourceModes[selectedItem])), body)
+      menuMessage = activeEndpoint.h50Upnp ?
+          mcuCommand(selectedItem==0 ? "MCU+PAS+RAKOIT:SRC:USB&" : "MCU+PAS+RAKOIT:SRC:BT&") ? "SOURCE SELECTED" : "SOURCE FAILED" :
+          request("setPlayerCmd:switchmode:" + (sourceCapabilitiesKnown ? discoveredSourceModes[selectedItem] : isCloud() ? (selectedItem == 4 ? String("HDMI ARC") : String(kSourceItems[selectedItem])) : String(kSourceModes[selectedItem])), body)
                         ? "SOURCE SELECTED" : "SOURCE FAILED";
       if (menuMessage == "SOURCE SELECTED") {
         invalidateArtwork();
@@ -2941,6 +3168,12 @@ void chooseMenuItem() {
       settings.putString("device", deviceIp);
       settings.putUChar("chip", uint8_t(activeEndpoint.chip));
       settings.putUShort("port", activeEndpoint.port); settings.putBool("tls", activeEndpoint.tls);
+      settings.putBool("h50",activeEndpoint.h50Upnp);
+      settings.putString("h50_rc",activeEndpoint.h50RenderPath);
+      settings.putString("h50_avt",activeEndpoint.h50TransportPath);
+      settings.putString("h50_play_avt",activeEndpoint.h50PlayTransportPath);
+      settings.putUShort("h50_play_port",activeEndpoint.h50PlayPort);
+      settings.putString("h50_pq",activeEndpoint.h50QueuePath);
       groupKnown = false;
       isSlave = false;
       masterIp = "";
@@ -2957,8 +3190,9 @@ void chooseMenuItem() {
     case MenuScreen::Settings:
       if (selectedItem == 0) {
         const String command = muted ? "MCU+MUT+000" : "MCU+MUT+001";
-        menuMessage = (mcuCommand(command) ||
-            request("setPlayerCmd:mute:" + String(muted ? 0 : 1), body))
+        menuMessage = (activeEndpoint.h50Upnp ?
+            request("setPlayerCmd:mute:" + String(muted ? 0 : 1), body) :
+            (mcuCommand(command) || request("setPlayerCmd:mute:" + String(muted ? 0 : 1), body)))
                           ? "MUTE UPDATED" : "MUTE FAILED";
         if (menuMessage == "MUTE UPDATED") muted = !muted;
       } else if (selectedItem == 1) {
@@ -2966,7 +3200,7 @@ void chooseMenuItem() {
         setMenu(MenuScreen::EqPresets); return;
       }
       else if (selectedItem == 2) {
-        if (activeEndpoint.chip == Chip::A97 || activeEndpoint.chip == Chip::A98) {
+        if ((activeEndpoint.chip == Chip::A97 || activeEndpoint.chip == Chip::A98) && !activeEndpoint.h50Upnp) {
           const bool ok = readGraphicEq(); setMenu(MenuScreen::EqBands);
           if (!ok) { menuMessage = "EQ API UNAVAILABLE"; drawMenu(); }
           return;
@@ -3017,7 +3251,8 @@ void chooseMenuItem() {
         break;
       }
       if (selectedItem == 3) {
-        if (activeEndpoint.chip != Chip::A31) menuMessage = "NOT SUPPORTED";
+        if (activeEndpoint.h50Upnp) menuMessage = "READ ONLY";
+        else if (activeEndpoint.chip != Chip::A31) menuMessage = "NOT SUPPORTED";
         else if (!virtualBassKnown) menuMessage = "REFRESH FIRST";
         else menuMessage = writeVirtualBass() ? "CONFIRMED" : "SAVE FAILED";
         break;
@@ -3137,7 +3372,7 @@ void pollButton() {
         const bool requestedPlaying = !playing;
         const String command = requestedPlaying ? "setPlayerCmd:resume" : "setPlayerCmd:pause";
         const String tcpCommand = requestedPlaying ? "MCU+PLY-PLA" : "MCU+PLY-PUS";
-        if (mcuCommand(tcpCommand) || request(command, body)) {
+        if ((activeEndpoint.h50Upnp ? request(command,body) : (mcuCommand(tcpCommand) || request(command, body)))) {
           playing = requestedPlaying;
           showFeedback(playing ? 1 : 2);
           deviceOnline = true;
@@ -3222,6 +3457,12 @@ void setup() {
   activeEndpoint.chip = Chip(settings.getUChar("chip", 0));
   activeEndpoint.port = settings.getUShort("port", 80);
   activeEndpoint.tls = settings.getBool("tls", false);
+  activeEndpoint.h50Upnp=settings.getBool("h50",false);
+  settings.getString("h50_rc",activeEndpoint.h50RenderPath,sizeof(activeEndpoint.h50RenderPath));
+  settings.getString("h50_avt",activeEndpoint.h50TransportPath,sizeof(activeEndpoint.h50TransportPath));
+  settings.getString("h50_play_avt",activeEndpoint.h50PlayTransportPath,sizeof(activeEndpoint.h50PlayTransportPath));
+  activeEndpoint.h50PlayPort=settings.getUShort("h50_play_port",59152);
+  settings.getString("h50_pq",activeEndpoint.h50QueuePath,sizeof(activeEndpoint.h50QueuePath));
   WiFi.mode(WIFI_STA);
   if (settings.getBool("fixed", false)) {
     IPAddress ip, gw, mask, dns;
@@ -3252,7 +3493,7 @@ void setup() {
   }
   portENTER_CRITICAL(&encoderMux); encoderRead = encoderWrite; encoderAccumulator = 0; portEXIT_CRITICAL(&encoderMux);
   drawScreen();
-  Serial.println("airControl KNOB v0.8.23: multi-chip zones");
+  Serial.printf("airControl KNOB v%s: multi-chip zones\n",kFirmwareVersion);
   Serial.printf("PSRAM: %s, free=%u bytes\n", psramFound() ? "available" : "not detected",
                 static_cast<unsigned>(ESP.getFreePsram()));
 }
