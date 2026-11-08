@@ -21,7 +21,7 @@ code=mock+r'''
 #include <cstdint>
 void convertFromJson(JsonVariantConst source,String& target){target=source.as<const char*>()?source.as<const char*>():"";}
 bool canConvertFromJson(JsonVariantConst source,const String&){return source.is<const char*>();}
-enum class Chip{A31,A33,A97,A98};struct Endpoint{Chip chip=Chip::A97;int port=443;bool tls=true;}activeEndpoint;
+enum class Chip{A31,A33,A97,A98};struct Endpoint{Chip chip=Chip::A97;int port=443;bool tls=true;bool h50Upnp=false;}activeEndpoint;
 String deviceIp="192.168.0.99",presetZone,presetReadError,presetReadSource;
 int presetReadHttp=0,presetReadBytes=0,presetReadPort=0,lastA31ActivityAt=0;
 struct DevicePreset{int slot=0;String name;};DevicePreset devicePresets[20];int devicePresetCount=0;
